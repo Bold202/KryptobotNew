@@ -198,6 +198,23 @@ class MainWindow:
 
         row1 = tk.Frame(ctrl, bg=BG_MID)
         row1.pack(fill=tk.X)
+        tk.Label(row1, text="Handelsmodus:", fg=TEXT_LIGHT, bg=BG_MID, width=20, anchor="w").pack(
+            side=tk.LEFT
+        )
+        self._mode_var = tk.StringVar(
+            value=self._config.get_section("trading").get("mode", "threshold_percent")
+        )
+        _mode_combo = ttk.Combobox(
+            row1,
+            textvariable=self._mode_var,
+            values=["threshold_percent", "fixed_eur_steps"],
+            state="readonly",
+            width=18,
+        )
+        _mode_combo.pack(side=tk.LEFT, padx=4)
+
+        row1 = tk.Frame(ctrl, bg=BG_MID)
+        row1.pack(fill=tk.X)
         tk.Label(row1, text="Schwellenwert (%):", fg=TEXT_LIGHT, bg=BG_MID, width=20, anchor="w").pack(
             side=tk.LEFT
         )
@@ -219,6 +236,11 @@ class MainWindow:
         ttk.Button(ctrl, text="Einstellungen speichern", command=self._save_settings).pack(
             anchor="w", pady=(8, 0)
         )
+        ttk.Button(
+            ctrl,
+            text="⚙ Coin-Strategien bearbeiten …",
+            command=self._show_strategy_editor,
+        ).pack(anchor="w", pady=(4, 0))
 
         # --- Manual trade ---
         tk.Label(
@@ -514,6 +536,7 @@ class MainWindow:
             messagebox.showerror("Ungültige Eingabe", "Bitte gültige Zahlen eingeben.")
             return
         updates = {
+            "mode": self._mode_var.get(),
             "threshold_percent": threshold,
             "check_interval_seconds": interval,
         }
@@ -521,6 +544,159 @@ class MainWindow:
         if self._engine:
             self._engine.update_config(self._config.get_section("trading"))
         self._log("✔ Einstellungen gespeichert.")
+
+    # ------------------------------------------------------------------
+    # Strategy Editor (fixed_eur_steps per-coin configuration)
+    # ------------------------------------------------------------------
+
+    def _show_strategy_editor(self):
+        """Open the Coin-Strategy editor dialog."""
+        win = tk.Toplevel(self._root)
+        win.title("KryptoBot – Coin-Strategien bearbeiten")
+        win.geometry("620x420")
+        win.configure(bg=BG_DARK)
+        win.grab_set()
+
+        tk.Label(
+            win,
+            text="Coin-Strategien (Fixed-Step Modus)",
+            font=("Helvetica", 13, "bold"),
+            fg=TEXT_LIGHT,
+            bg=BG_DARK,
+        ).pack(pady=(12, 2))
+        tk.Label(
+            win,
+            text="Kauf bei Wert ≤ Basiswert − Schritt  |  Verkauf bei Wert ≥ Basiswert + Schritt",
+            font=("Helvetica", 9),
+            fg=TEXT_DIM,
+            bg=BG_DARK,
+        ).pack(pady=(0, 6))
+
+        frame = tk.Frame(win, bg=BG_MID)
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 6))
+
+        cols = ("Handelspaar", "Basiswert (USD)", "Schrittgröße (USD)")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=180, anchor="center")
+        tree.column("Handelspaar", width=160)
+
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        strategies = list(self._config.get_section("trading").get("coin_strategies", []))
+
+        def _refresh():
+            for row in tree.get_children():
+                tree.delete(row)
+            for s in strategies:
+                tree.insert("", tk.END, values=(
+                    s.get("product_id", ""),
+                    f"{s.get('base_value_usd', 25.0):.2f}",
+                    f"{s.get('step_usd', 0.5):.4f}",
+                ))
+
+        _refresh()
+
+        def _entry_dialog(title, initial=None):
+            """Open add/edit dialog; returns dict or None."""
+            dlg = tk.Toplevel(win)
+            dlg.title(title)
+            dlg.configure(bg=BG_DARK)
+            dlg.grab_set()
+            dlg.resizable(False, False)
+
+            result = {}
+
+            def _lbl_entry(parent, label, default=""):
+                row = tk.Frame(parent, bg=BG_DARK)
+                row.pack(fill=tk.X, padx=16, pady=4)
+                tk.Label(row, text=label, fg=TEXT_LIGHT, bg=BG_DARK, width=22, anchor="w").pack(side=tk.LEFT)
+                var = tk.StringVar(value=default)
+                ttk.Entry(row, textvariable=var, width=18).pack(side=tk.LEFT, padx=4)
+                return var
+
+            tk.Label(dlg, text=title, font=("Helvetica", 11, "bold"),
+                     fg=TEXT_LIGHT, bg=BG_DARK).pack(pady=(12, 6))
+            pid_var = _lbl_entry(dlg, "Handelspaar (z.B. BTC-USD):",
+                                 initial.get("product_id", "") if initial else "")
+            base_var = _lbl_entry(dlg, "Basiswert (USD):",
+                                  str(initial.get("base_value_usd", 25.0)) if initial else "25.0")
+            step_var = _lbl_entry(dlg, "Schrittgröße (USD):",
+                                  str(initial.get("step_usd", 0.5)) if initial else "0.5")
+
+            def _ok():
+                try:
+                    pid = pid_var.get().strip().upper()
+                    base = float(base_var.get())
+                    step = float(step_var.get())
+                    if not pid:
+                        raise ValueError("Handelspaar darf nicht leer sein.")
+                    if base <= 0 or step <= 0:
+                        raise ValueError("Basiswert und Schrittgröße müssen positiv sein.")
+                    result["product_id"] = pid
+                    result["base_value_usd"] = base
+                    result["step_usd"] = step
+                    dlg.destroy()
+                except ValueError as exc:
+                    messagebox.showerror("Ungültige Eingabe", str(exc), parent=dlg)
+
+            btn_row = tk.Frame(dlg, bg=BG_DARK)
+            btn_row.pack(pady=(8, 12))
+            ttk.Button(btn_row, text="OK", command=_ok).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btn_row, text="Abbrechen", command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
+            dlg.wait_window()
+            return result if result else None
+
+        def _on_add():
+            entry = _entry_dialog("Coin-Strategie hinzufügen")
+            if entry:
+                # Replace if product_id already exists
+                for i, s in enumerate(strategies):
+                    if s.get("product_id") == entry["product_id"]:
+                        strategies[i] = entry
+                        _refresh()
+                        return
+                strategies.append(entry)
+                _refresh()
+
+        def _on_edit():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Hinweis", "Bitte eine Strategie auswählen.", parent=win)
+                return
+            idx = tree.index(sel[0])
+            entry = _entry_dialog("Coin-Strategie bearbeiten", initial=strategies[idx])
+            if entry:
+                strategies[idx] = entry
+                _refresh()
+
+        def _on_delete():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Hinweis", "Bitte eine Strategie auswählen.", parent=win)
+                return
+            idx = tree.index(sel[0])
+            del strategies[idx]
+            _refresh()
+
+        def _on_save():
+            self._config.update_section("trading", {"coin_strategies": strategies})
+            if self._engine:
+                self._engine.update_config(self._config.get_section("trading"))
+            self._log(f"✔ Coin-Strategien gespeichert ({len(strategies)} Einträge).")
+            win.destroy()
+
+        btn_frame = tk.Frame(win, bg=BG_DARK)
+        btn_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
+        ttk.Button(btn_frame, text="➕ Hinzufügen", command=_on_add).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(btn_frame, text="✏ Bearbeiten", command=_on_edit).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="🗑 Entfernen", command=_on_delete).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="💾 Speichern & Schließen", command=_on_save).pack(side=tk.RIGHT)
 
     # ------------------------------------------------------------------
     # Manual trade

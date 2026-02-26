@@ -20,6 +20,7 @@ DEFAULTS = {
     },
     "trading": {
         "enabled": False,
+        "mode": "threshold_percent",
         "threshold_percent": 2.0,
         "check_interval_seconds": 60,
         "pairs": [],
@@ -27,6 +28,7 @@ DEFAULTS = {
         "order_size_percent": 5.0,
         "max_position_percent": 50.0,
         "max_daily_loss_percent": 5.0,
+        "coin_strategies": [],
     },
     "api": {
         "enabled": True,
