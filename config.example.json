@@ -1,0 +1,19 @@
+{
+  "coinbase": {
+    "api_key": "YOUR_COINBASE_API_KEY",
+    "api_secret": "YOUR_COINBASE_API_SECRET",
+    "use_sandbox": false
+  },
+  "trading": {
+    "enabled": false,
+    "threshold_percent": 2.0,
+    "check_interval_seconds": 60,
+    "pairs": []
+  },
+  "api": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "wizard_completed": false
+}
