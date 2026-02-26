@@ -28,6 +28,7 @@ DEFAULTS = {
         "order_size_percent": 5.0,
         "max_position_percent": 50.0,
         "max_daily_loss_percent": 5.0,
+        "live_trading_armed": False,
         "coin_strategies": [],
     },
     "api": {
