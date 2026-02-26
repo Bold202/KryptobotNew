@@ -33,14 +33,16 @@ logger = logging.getLogger(__name__)
 
 _engine = None       # TradingEngine instance
 _config = None       # ConfigManager instance
+_session = None      # SessionManager instance
 _event_log: deque = deque(maxlen=200)
 
 
-def init(engine, config):
+def init(engine, config, session_manager=None):
     """Inject dependencies before calling start_server()."""
-    global _engine, _config
+    global _engine, _config, _session
     _engine = engine
     _config = config
+    _session = session_manager
 
 
 def add_event(event_type: str, data: dict):
@@ -168,6 +170,22 @@ def trade_sell():
         return jsonify({"status": "ok", "result": result})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/sessions")
+def sessions_list():
+    """Liste der vergangenen Sitzungen (neueste zuerst)."""
+    if _session is None:
+        return jsonify({"sessions": []})
+    return jsonify({"sessions": _session.get_history()})
+
+
+@app.route("/sessions/current")
+def sessions_current():
+    """Aktuelle laufende Sitzung (oder null, wenn keine aktiv)."""
+    if _session is None:
+        return jsonify({"session": None})
+    return jsonify({"session": _session.get_current()})
 
 
 # -----------------------------------------------------------------------
