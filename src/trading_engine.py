@@ -19,9 +19,10 @@ class TradingEngine:
     Background price-monitoring loop that fires trades when a coin's price
     moves more than *threshold_percent* from its reference price.
 
-    Auto-Trade-Strategie (Mean-Revert):
-      - Kurs fällt stark → automatischer Kauf (günstig einkaufen)
-      - Kurs steigt stark → automatischer Verkauf (Gewinne mitnehmen)
+    Supported modes (trading.mode):
+      - threshold_percent (default): fires when price changes by a set %
+      - fixed_eur_steps: buy/sell a fixed USD amount per coin when the
+        coin's portfolio value crosses base_value ± step thresholds.
     """
 
     def __init__(self, client: CoinbaseClient, config: dict, on_event: Optional[Callable] = None,
@@ -43,6 +44,9 @@ class TradingEngine:
 
         # product_id -> reference price captured at engine start / after trade
         self._reference_prices: Dict[str, float] = {}
+
+        # fixed_eur_steps mode: per-coin state {"last_action": None|"BUY"|"SELL"}
+        self._coin_states: Dict[str, dict] = {}
 
         # Latest snapshot: list of {currency, balance, price_usd, value_usd, product_id}
         self.portfolio_snapshot: List[dict] = []
@@ -104,6 +108,18 @@ class TradingEngine:
         self.portfolio_snapshot = coins
         self._on_event("portfolio_update", {"coins": coins})
 
+        mode = self._config.get("mode", "threshold_percent")
+        if mode == "fixed_eur_steps":
+            self._tick_fixed_eur_steps(coins)
+        else:
+            self._tick_threshold(coins)
+
+    # ------------------------------------------------------------------
+    # Mode: threshold_percent (original logic)
+    # ------------------------------------------------------------------
+
+    def _tick_threshold(self, coins: List[dict]):
+        """Original threshold-based price monitoring."""
         # Portfolio-Gesamtwert berechnen (für Verlustlimit und Positionsgröße)
         total_portfolio_usd = sum(c.get("value_usd", 0.0) for c in coins)
 
@@ -161,7 +177,7 @@ class TradingEngine:
             self._maybe_auto_trade(product_id, current_price, change_pct, coin, total_portfolio_usd)
 
     # ------------------------------------------------------------------
-    # Auto-Trade Logic
+    # Auto-Trade Logic (threshold mode)
     # ------------------------------------------------------------------
 
     def _maybe_auto_trade(self, product_id: str, current_price: float, change_pct: float,
@@ -273,6 +289,107 @@ class TradingEngine:
             self._on_event("error", {"message": f"Auto-Trade Fehler ({product_id}): {exc}"})
 
     # ------------------------------------------------------------------
+    # Mode: fixed_eur_steps
+    # ------------------------------------------------------------------
+
+    def _tick_fixed_eur_steps(self, coins: List[dict]):
+        """
+        Fixed-step strategy (per-coin):
+          - value >= base_value + step AND last_action != "BUY"  → SELL step worth
+          - value <= base_value - step                           → BUY step worth
+
+        After a BUY, further SELLs are blocked until a SELL occurs first.
+        """
+        coin_map = {c.get("product_id"): c for c in coins if c.get("product_id")}
+        strategies = self._config.get("coin_strategies", [])
+
+        for strategy in strategies:
+            product_id = strategy.get("product_id")
+            if not product_id:
+                continue
+            base_value = float(strategy.get("base_value_usd", 25.0))
+            step = float(strategy.get("step_usd", 0.5))
+
+            coin = coin_map.get(product_id)
+            if coin is None:
+                continue
+
+            current_price = float(coin.get("price_usd", 0.0))
+            balance = float(coin.get("balance", 0.0))
+            if current_price <= 0:
+                continue
+
+            value = balance * current_price
+            state = self._coin_states.setdefault(product_id, {"last_action": None})
+            last_action = state.get("last_action")
+
+            logger.debug(
+                "fixed_step %s: value=%.4f base=%.4f step=%.4f last_action=%s",
+                product_id, value, base_value, step, last_action,
+            )
+
+            if value >= base_value + step:
+                # Sell only if the previous action was not a BUY (anti-oscillation lock)
+                if last_action != "BUY":
+                    base_size = step / current_price
+                    self._execute_fixed_step_trade(
+                        product_id, "SELL", base_size, current_price, value, base_value, step,
+                    )
+                    state["last_action"] = "SELL"
+                else:
+                    logger.debug(
+                        "fixed_step %s: SELL geblockt (last_action=BUY)", product_id,
+                    )
+            elif value <= base_value - step:
+                base_size = step / current_price
+                self._execute_fixed_step_trade(
+                    product_id, "BUY", base_size, current_price, value, base_value, step,
+                )
+                state["last_action"] = "BUY"
+
+    def _execute_fixed_step_trade(self, product_id: str, side: str, base_size: float,
+                                  current_price: float, current_value: float,
+                                  base_value: float, step: float):
+        """Execute a single trade for the fixed-step strategy."""
+        usd_amount = base_size * current_price
+        threshold = base_value + step if side == "SELL" else base_value - step
+        op_sym = "≥" if side == "SELL" else "≤"
+        action_word = "verkaufe" if side == "SELL" else "kaufe"
+        msg = (
+            f"Fixed-Step {side}: {product_id} Wert {current_value:.4f} USD "
+            f"({op_sym} {threshold:.4f}) → {action_word} {base_size:.6f} (≈ {usd_amount:.4f} USD)"
+        )
+        logger.info(msg)
+        self._on_event("auto_trade_decision", {
+            "product_id": product_id,
+            "side": side,
+            "base_size": base_size,
+            "price_usd": current_price,
+            "change_pct": 0.0,
+            "message": msg,
+        })
+
+        try:
+            result = self._client.place_market_order(product_id, side, str(base_size))
+            logger.info(
+                "Fixed-Step Trade ausgeführt: %s %s %.6f @ %.4f",
+                side, product_id, base_size, current_price,
+            )
+            self._on_event("order_placed", {
+                "side": side,
+                "product_id": product_id,
+                "base_size": base_size,
+                "price_usd": current_price,
+                "is_auto": True,
+                "result": result,
+            })
+            if self._session:
+                self._session.record_trade(side, product_id, base_size, current_price, is_auto=True)
+        except Exception as exc:
+            logger.error("Fixed-Step Trade fehlgeschlagen für %s: %s", product_id, exc)
+            self._on_event("error", {"message": f"Fixed-Step Trade Fehler ({product_id}): {exc}"})
+
+    # ------------------------------------------------------------------
     # Manual trade helpers (called from GUI / API)
     # ------------------------------------------------------------------
 
@@ -314,3 +431,4 @@ class TradingEngine:
 
     def update_config(self, new_config: dict):
         self._config = new_config
+

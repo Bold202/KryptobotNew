@@ -622,5 +622,156 @@ class TestAPIServerSessions(unittest.TestCase):
         self.assertIn("session_id", data["session"])
 
 
+
+
+# =============================================================================
+# TradingEngine fixed_eur_steps strategy tests
+# =============================================================================
+
+class TestTradingEngineFixedSteps(unittest.TestCase):
+    def _make_engine(self, strategies, events=None):
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        cfg = {
+            "mode": "fixed_eur_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": strategies,
+        }
+        collected = events if events is not None else []
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)))
+        return engine, client, collected
+
+    def _coin(self, product_id, balance, price_usd):
+        return {
+            "currency": product_id.split("-")[0],
+            "balance": balance,
+            "price_usd": price_usd,
+            "value_usd": balance * price_usd,
+            "product_id": product_id,
+        }
+
+    def test_sell_when_value_exceeds_base_plus_step(self):
+        """Value ≥ base + step → SELL."""
+        strategies = [{"product_id": "BTC-USD", "base_value_usd": 25.0, "step_usd": 0.5}]
+        engine, client, events = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "s1"}
+
+        # value = 0.1 * 255.0 = 25.5  (= base + step)
+        coin = self._coin("BTC-USD", 0.1, 255.0)
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls))
+
+    def test_buy_when_value_below_base_minus_step(self):
+        """Value ≤ base − step → BUY."""
+        strategies = [{"product_id": "BTC-USD", "base_value_usd": 25.0, "step_usd": 0.5}]
+        engine, client, events = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "b1"}
+
+        # value = 0.1 * 245.0 = 24.5  (= base - step)
+        coin = self._coin("BTC-USD", 0.1, 245.0)
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "BUY" for c in calls))
+
+    def test_no_trade_within_band(self):
+        """Value within (base-step, base+step) → no trade."""
+        strategies = [{"product_id": "BTC-USD", "base_value_usd": 25.0, "step_usd": 0.5}]
+        engine, client, events = self._make_engine(strategies)
+
+        # value = 0.1 * 250.0 = 25.0 exactly at base
+        coin = self._coin("BTC-USD", 0.1, 250.0)
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        client.place_market_order.assert_not_called()
+
+    def test_sell_blocked_after_buy(self):
+        """After a BUY, an immediate SELL is blocked (anti-oscillation)."""
+        strategies = [{"product_id": "BTC-USD", "base_value_usd": 25.0, "step_usd": 0.5}]
+        engine, client, events = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "x"}
+
+        # First tick: BUY (value drops to 24.5)
+        coin_buy = self._coin("BTC-USD", 0.1, 245.0)
+        client.get_owned_coins_with_prices.return_value = [coin_buy]
+        engine._tick()
+        client.place_market_order.reset_mock()
+
+        # Second tick: value rises to 25.5 → SELL should be blocked (last_action=BUY)
+        coin_sell = self._coin("BTC-USD", 0.1, 255.0)
+        client.get_owned_coins_with_prices.return_value = [coin_sell]
+        engine._tick()
+
+        client.place_market_order.assert_not_called()
+
+    def test_sell_allowed_after_buy_then_sell(self):
+        """After BUY → SELL sequence, next SELL trigger is allowed."""
+        strategies = [{"product_id": "BTC-USD", "base_value_usd": 25.0, "step_usd": 0.5}]
+        engine, client, events = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "x"}
+
+        # Force last_action = SELL directly (simulating a prior SELL)
+        engine._coin_states["BTC-USD"] = {"last_action": "SELL"}
+
+        coin_sell = self._coin("BTC-USD", 0.1, 255.0)
+        client.get_owned_coins_with_prices.return_value = [coin_sell]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls))
+
+    def test_state_last_action_set_after_buy(self):
+        """last_action is set to BUY after a buy trade."""
+        strategies = [{"product_id": "ETH-USD", "base_value_usd": 10.0, "step_usd": 1.0}]
+        engine, client, events = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "e1"}
+
+        # value = 1.0 * 9.0 = 9.0  (≤ base - step = 9.0)
+        coin = self._coin("ETH-USD", 1.0, 9.0)
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        self.assertEqual(engine._coin_states["ETH-USD"]["last_action"], "BUY")
+
+    def test_state_last_action_set_after_sell(self):
+        """last_action is set to SELL after a sell trade."""
+        strategies = [{"product_id": "ETH-USD", "base_value_usd": 10.0, "step_usd": 1.0}]
+        engine, client, events = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "e2"}
+
+        # value = 1.0 * 11.0 = 11.0  (≥ base + step = 11.0)
+        coin = self._coin("ETH-USD", 1.0, 11.0)
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        self.assertEqual(engine._coin_states["ETH-USD"]["last_action"], "SELL")
+
+    def test_multiple_coins_independent(self):
+        """Multiple coins in strategy are handled independently."""
+        strategies = [
+            {"product_id": "BTC-USD", "base_value_usd": 25.0, "step_usd": 0.5},
+            {"product_id": "ETH-USD", "base_value_usd": 10.0, "step_usd": 1.0},
+        ]
+        engine, client, events = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "m1"}
+
+        # BTC triggers SELL, ETH triggers BUY
+        coins = [
+            self._coin("BTC-USD", 0.1, 255.0),  # 25.5 ≥ 25.5 → SELL
+            self._coin("ETH-USD", 1.0, 9.0),    # 9.0 ≤ 9.0 → BUY
+        ]
+        client.get_owned_coins_with_prices.return_value = coins
+        engine._tick()
+
+        sides = [c[0][1] for c in client.place_market_order.call_args_list]
+        self.assertIn("SELL", sides)
+        self.assertIn("BUY", sides)
+
+
 if __name__ == "__main__":
     unittest.main()
