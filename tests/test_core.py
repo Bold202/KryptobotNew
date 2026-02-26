@@ -773,5 +773,137 @@ class TestTradingEngineFixedSteps(unittest.TestCase):
         self.assertIn("BUY", sides)
 
 
+# =============================================================================
+# TradingEngine fixed_steps mode: new field names, enabled flag, mode alias
+# =============================================================================
+
+class TestTradingEngineFixedStepsNewFields(unittest.TestCase):
+    """Tests for the extended fixed-step strategy:
+    - 'base_value'/'step' field names (preferred)
+    - 'enabled' per-coin flag
+    - 'fixed_steps' mode alias
+    """
+
+    def _make_engine(self, strategies, mode="fixed_steps", events=None):
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        cfg = {
+            "mode": mode,
+            "check_interval_seconds": 9999,
+            "coin_strategies": strategies,
+        }
+        collected = events if events is not None else []
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)))
+        return engine, client, collected
+
+    def _coin(self, product_id, balance, price_usd):
+        return {
+            "currency": product_id.split("-")[0],
+            "balance": balance,
+            "price_usd": price_usd,
+            "value_usd": balance * price_usd,
+            "product_id": product_id,
+        }
+
+    def test_new_field_names_sell_trigger(self):
+        """'base_value'/'step' field names trigger SELL correctly."""
+        strategies = [{"product_id": "BTC-USD", "base_value": 25.0, "step": 0.5}]
+        engine, client, _ = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "n1"}
+
+        coin = self._coin("BTC-USD", 0.1, 255.0)  # value = 25.5 >= 25.5
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls))
+
+    def test_new_field_names_buy_trigger(self):
+        """'base_value'/'step' field names trigger BUY correctly."""
+        strategies = [{"product_id": "BTC-USD", "base_value": 25.0, "step": 0.5}]
+        engine, client, _ = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "n2"}
+
+        coin = self._coin("BTC-USD", 0.1, 245.0)  # value = 24.5 <= 24.5
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "BUY" for c in calls))
+
+    def test_enabled_false_skips_coin(self):
+        """Strategy with enabled=False is not executed."""
+        strategies = [{"product_id": "BTC-USD", "base_value": 25.0, "step": 0.5, "enabled": False}]
+        engine, client, _ = self._make_engine(strategies)
+
+        coin = self._coin("BTC-USD", 0.1, 255.0)  # would normally trigger SELL
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        client.place_market_order.assert_not_called()
+
+    def test_enabled_true_executes_coin(self):
+        """Strategy with enabled=True is executed."""
+        strategies = [{"product_id": "BTC-USD", "base_value": 25.0, "step": 0.5, "enabled": True}]
+        engine, client, _ = self._make_engine(strategies)
+        client.place_market_order.return_value = {"order_id": "e1"}
+
+        coin = self._coin("BTC-USD", 0.1, 255.0)  # value = 25.5 >= 25.5 → SELL
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls))
+
+    def test_fixed_steps_mode_alias(self):
+        """mode='fixed_steps' activates fixed-step strategy (alias for fixed_eur_steps)."""
+        strategies = [{"product_id": "ETH-USD", "base_value": 10.0, "step": 1.0}]
+        engine, client, _ = self._make_engine(strategies, mode="fixed_steps")
+        client.place_market_order.return_value = {"order_id": "alias1"}
+
+        coin = self._coin("ETH-USD", 1.0, 11.0)  # value = 11.0 >= 11.0 → SELL
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls))
+
+    def test_mixed_old_new_field_names_fallback(self):
+        """Legacy 'base_value_usd'/'step_usd' still work when new names absent."""
+        strategies = [{"product_id": "BTC-USD", "base_value_usd": 25.0, "step_usd": 0.5}]
+        engine, client, _ = self._make_engine(strategies, mode="fixed_steps")
+        client.place_market_order.return_value = {"order_id": "leg1"}
+
+        coin = self._coin("BTC-USD", 0.1, 255.0)  # value = 25.5 >= 25.5 → SELL
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls))
+
+    def test_security_limits_applied_when_configured(self):
+        """max_position_percent blocks BUY when explicitly configured."""
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        cfg = {
+            "mode": "fixed_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": [{"product_id": "BTC-USD", "base_value": 25.0, "step": 0.5}],
+            "max_position_percent": 10.0,  # very tight limit
+        }
+        events = []
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: events.append((t, d)))
+
+        # total = 24.5, limit = 2.45; coin + step = 25.0 > 2.45 → blocked
+        coin = {"currency": "BTC", "balance": 0.1, "price_usd": 245.0,
+                "value_usd": 24.5, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        client.place_market_order.assert_not_called()
+        limit_events = [e for e in events if e[0] == "limit_blocked"]
+        self.assertTrue(len(limit_events) > 0)
+
+
 if __name__ == "__main__":
     unittest.main()
