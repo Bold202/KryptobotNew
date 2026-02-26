@@ -96,6 +96,30 @@ class MainWindow:
             bg=BG_DARK,
         ).pack(side=tk.LEFT)
 
+        # Sandbox / Live badge
+        use_sandbox = self._config.get_section("coinbase").get("use_sandbox", True)
+        armed = self._config.get_section("trading").get("live_trading_armed", False)
+        if use_sandbox:
+            badge_text = "🟢 SANDBOX (sicher)"
+            badge_bg = GREEN
+        elif armed:
+            badge_text = "🔴 LIVE (ECHTES GELD)"
+            badge_bg = RED
+        else:
+            badge_text = "⚠ LIVE (nicht scharf)"
+            badge_bg = "#e67e00"
+        self._mode_badge = tk.Label(
+            header,
+            text=badge_text,
+            font=("Helvetica", 10, "bold"),
+            fg="white",
+            bg=badge_bg,
+            padx=8,
+            pady=2,
+            relief=tk.FLAT,
+        )
+        self._mode_badge.pack(side=tk.LEFT, padx=(12, 0))
+
         # Toggle button (right side of header)
         self._toggle_var = tk.StringVar(value="● AN")
         self._toggle_btn = tk.Button(
@@ -485,6 +509,21 @@ class MainWindow:
             self._toggle_var.set("○ AUS")
             self._toggle_btn.config(bg=RED)
 
+    def _update_mode_badge(self):
+        """Refresh the sandbox/live badge based on current config."""
+        use_sandbox = self._config.get_section("coinbase").get("use_sandbox", True)
+        armed = self._config.get_section("trading").get("live_trading_armed", False)
+        if use_sandbox:
+            badge_text = "🟢 SANDBOX (sicher)"
+            badge_bg = GREEN
+        elif armed:
+            badge_text = "🔴 LIVE (ECHTES GELD)"
+            badge_bg = RED
+        else:
+            badge_text = "⚠ LIVE (nicht scharf)"
+            badge_bg = "#e67e00"
+        self._mode_badge.config(text=badge_text, bg=badge_bg)
+
     # ------------------------------------------------------------------
     # Portfolio refresh
     # ------------------------------------------------------------------
@@ -542,7 +581,11 @@ class MainWindow:
         }
         self._config.update_section("trading", updates)
         if self._engine:
-            self._engine.update_config(self._config.get_section("trading"))
+            self._engine.update_config(
+                self._config.get_section("trading"),
+                coinbase_config=self._config.get_section("coinbase"),
+            )
+        self._update_mode_badge()
         self._log("✔ Einstellungen gespeichert.")
 
     # ------------------------------------------------------------------
@@ -645,14 +688,23 @@ class MainWindow:
             ttk.Checkbutton(enabled_row, variable=enabled_var).pack(side=tk.LEFT, padx=4)
 
             def _ok():
+                import re
                 try:
                     pid = pid_var.get().strip().upper()
                     base = float(base_var.get())
                     step = float(step_var.get())
                     if not pid:
                         raise ValueError("Handelspaar darf nicht leer sein.")
-                    if base <= 0 or step <= 0:
-                        raise ValueError("Basiswert und Schrittgröße müssen positiv sein.")
+                    if not re.match(r'^[A-Z]{2,10}-[A-Z]{2,10}$', pid):
+                        raise ValueError(
+                            "Handelspaar muss Format 'XXX-YYY' haben (z.B. BTC-USD, ETH-EUR)."
+                        )
+                    if base <= 0:
+                        raise ValueError("Basiswert muss größer als 0 sein.")
+                    if step <= 0:
+                        raise ValueError("Schrittgröße muss größer als 0 sein.")
+                    if step >= base:
+                        raise ValueError("Schrittgröße muss kleiner als der Basiswert sein.")
                     result["product_id"] = pid
                     result["base_value"] = base
                     result["step"] = step
@@ -701,6 +753,64 @@ class MainWindow:
             del strategies[idx]
             _refresh()
 
+        def _on_enable_all():
+            for s in strategies:
+                s["enabled"] = True
+            _refresh()
+
+        def _on_disable_all():
+            for s in strategies:
+                s["enabled"] = False
+            _refresh()
+
+        def _on_apply_defaults():
+            """Open dialog to set base_value + step once, apply to all strategies."""
+            dlg = tk.Toplevel(win)
+            dlg.title("Standard auf alle anwenden")
+            dlg.configure(bg=BG_DARK)
+            dlg.grab_set()
+            dlg.resizable(False, False)
+
+            tk.Label(dlg, text="Standard auf alle Einträge anwenden",
+                     font=("Helvetica", 11, "bold"), fg=TEXT_LIGHT, bg=BG_DARK).pack(pady=(12, 6))
+
+            def _lbl_entry_d(parent, label, default=""):
+                row = tk.Frame(parent, bg=BG_DARK)
+                row.pack(fill=tk.X, padx=16, pady=4)
+                tk.Label(row, text=label, fg=TEXT_LIGHT, bg=BG_DARK, width=22, anchor="w").pack(side=tk.LEFT)
+                var = tk.StringVar(value=default)
+                ttk.Entry(row, textvariable=var, width=18).pack(side=tk.LEFT, padx=4)
+                return var
+
+            base_var_d = _lbl_entry_d(dlg, "Basiswert (USD):", "25.0")
+            step_var_d = _lbl_entry_d(dlg, "Schrittgröße (USD):", "0.5")
+
+            def _apply():
+                try:
+                    base = float(base_var_d.get())
+                    step = float(step_var_d.get())
+                    if base <= 0:
+                        raise ValueError("Basiswert muss größer als 0 sein.")
+                    if step <= 0:
+                        raise ValueError("Schrittgröße muss größer als 0 sein.")
+                    if step >= base:
+                        raise ValueError("Schrittgröße muss kleiner als der Basiswert sein.")
+                    for s in strategies:
+                        s["base_value"] = base
+                        s["step"] = step
+                        s.pop("base_value_usd", None)
+                        s.pop("step_usd", None)
+                    _refresh()
+                    dlg.destroy()
+                except ValueError as exc:
+                    messagebox.showerror("Ungültige Eingabe", str(exc), parent=dlg)
+
+            btn_row_d = tk.Frame(dlg, bg=BG_DARK)
+            btn_row_d.pack(pady=(8, 12))
+            ttk.Button(btn_row_d, text="Anwenden", command=_apply).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btn_row_d, text="Abbrechen", command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+            dlg.wait_window()
+
         def _on_save():
             self._config.update_section("trading", {"coin_strategies": strategies})
             if self._engine:
@@ -709,11 +819,17 @@ class MainWindow:
             win.destroy()
 
         btn_frame = tk.Frame(win, bg=BG_DARK)
-        btn_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
+        btn_frame.pack(fill=tk.X, padx=12, pady=(0, 4))
         ttk.Button(btn_frame, text="➕ Hinzufügen", command=_on_add).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(btn_frame, text="✏ Bearbeiten", command=_on_edit).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="🗑 Entfernen", command=_on_delete).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="💾 Speichern & Schließen", command=_on_save).pack(side=tk.RIGHT)
+
+        btn_frame2 = tk.Frame(win, bg=BG_DARK)
+        btn_frame2.pack(fill=tk.X, padx=12, pady=(0, 10))
+        ttk.Button(btn_frame2, text="✅ Alle aktivieren", command=_on_enable_all).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(btn_frame2, text="☐ Alle deaktivieren", command=_on_disable_all).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame2, text="⚙ Standard auf alle anwenden", command=_on_apply_defaults).pack(side=tk.LEFT, padx=4)
 
     # ------------------------------------------------------------------
     # Manual trade
@@ -778,6 +894,7 @@ class MainWindow:
             sandbox = self._config.get_section("coinbase").get("use_sandbox", False)
             status = f"Automatik AN  |  Auto-Trade: {'JA' if auto else 'NEIN'}  |  Sandbox: {'JA' if sandbox else 'NEIN'}"
             self._sess_status_var.set(status)
+            self._update_mode_badge()
         elif event_type == "session_ended":
             self._sess_status_var.set("Automatik AUS")
             self._update_session_display()
@@ -797,6 +914,8 @@ class MainWindow:
             self._update_session_display()
         elif event_type == "limit_blocked":
             self._log(f"🚫 Limit-Sperre: {data.get('message', '')}")
+        elif event_type == "trade_blocked_safety":
+            self._log(f"🔒 Sicherheitssperre: {data.get('message', '')}")
         elif event_type == "error":
             self._log(f"❌ Fehler: {data.get('message')}")
 
@@ -829,6 +948,8 @@ class MainWindow:
             self._update_toggle_state(True)
         else:
             self._update_toggle_state(False)
+
+        self._update_mode_badge()
 
         # Sitzungsstatus initialisieren
         sandbox = self._config.get_section("coinbase").get("use_sandbox", False)

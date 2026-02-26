@@ -14,12 +14,15 @@
     "order_size_percent": 5.0,
     "max_position_percent": 50.0,
     "max_daily_loss_percent": 5.0,
+    "live_trading_armed": false,
     "coin_strategies": [
       {
         "product_id": "BTC-USD",
         "enabled": true,
         "base_value": 25.0,
-        "step": 0.5
+        "step": 0.5,
+        "cooldown_seconds": 60,
+        "max_trades_per_hour": 6
       }
     ]
   },

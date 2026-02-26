@@ -7,6 +7,7 @@ Trading Engine: monitors prices and executes trades when thresholds are met.
 import logging
 import threading
 import time
+from collections import deque
 from typing import Callable, Dict, List, Optional
 
 from coinbase_client import CoinbaseClient, CoinbaseAPIError
@@ -26,17 +27,19 @@ class TradingEngine:
     """
 
     def __init__(self, client: CoinbaseClient, config: dict, on_event: Optional[Callable] = None,
-                 session_manager=None):
+                 session_manager=None, coinbase_config: Optional[dict] = None):
         """
         :param client:           initialised CoinbaseClient
         :param config:           'trading' section from ConfigManager
         :param on_event:         callback(event_type, data) for GUI / API updates
         :param session_manager:  optional SessionManager instance
+        :param coinbase_config:  optional 'coinbase' section for sandbox/live check
         """
         self._client = client
         self._config = config
         self._on_event = on_event or (lambda *_: None)
         self._session = session_manager  # Sitzungserfassung
+        self._coinbase_config = coinbase_config or {}
 
         self._active = False
         self._thread: Optional[threading.Thread] = None
@@ -47,6 +50,9 @@ class TradingEngine:
 
         # fixed_eur_steps mode: per-coin state {"last_action": None|"BUY"|"SELL"}
         self._coin_states: Dict[str, dict] = {}
+
+        # Anti-churn: per-coin trade timestamps (deque of float timestamps)
+        self._trade_timestamps: Dict[str, deque] = {}
 
         # Latest snapshot: list of {currency, balance, price_usd, value_usd, product_id}
         self.portfolio_snapshot: List[dict] = []
@@ -188,10 +194,16 @@ class TradingEngine:
           - Kurs stark gestiegen → Verkauf (Gewinne mitnehmen)
 
         Sicherheitsprüfungen:
+          - Safe Live Mode: Live-Trading nur wenn live_trading_armed=True
           - max_order_size_percent: Ein Trade darf nicht mehr als X% des Gesamtportfolios umfassen
           - max_position_percent:   Eine Coin-Position darf X% des Portfolios nicht überschreiten
           - max_daily_loss_percent: Bei zu großem Tagesverlust wird der Automatik-Handel gestoppt
         """
+        # --- Safe Live Mode check ---
+        if not self._is_trading_allowed():
+            self._block_trade(product_id, "auto_trade")
+            return
+
         order_size_pct = float(self._config.get("order_size_percent", 5.0))
         max_position_pct = float(self._config.get("max_position_percent", 50.0))
         max_daily_loss_pct = float(self._config.get("max_daily_loss_percent", 5.0))
@@ -273,6 +285,7 @@ class TradingEngine:
         try:
             result = self._client.place_market_order(product_id, side, str(base_size))
             logger.info("Auto-Trade ausgeführt: %s %s %.6f @ %.4f", side, product_id, base_size, current_price)
+            self._record_anti_churn_trade(product_id)
             self._on_event("order_placed", {
                 "side": side,
                 "product_id": product_id,
@@ -355,6 +368,22 @@ class TradingEngine:
                         "reason": "anti_oscillation", "message": msg, "product_id": product_id,
                     })
                 else:
+                    # Safe Live Mode check
+                    if not self._is_trading_allowed():
+                        self._block_trade(product_id, "fixed_step SELL")
+                        continue
+                    # Anti-churn check
+                    churn_reason = self._check_anti_churn(product_id, strategy)
+                    if churn_reason:
+                        msg = (
+                            f"Trade geblockt für {product_id}: "
+                            f"{'Cooldown läuft noch' if churn_reason == 'cooldown' else 'Max. Trades/Stunde erreicht'}."
+                        )
+                        logger.debug(msg)
+                        self._on_event("limit_blocked", {
+                            "reason": churn_reason, "message": msg, "product_id": product_id,
+                        })
+                        continue
                     # Daily-loss check (only when limit is configured)
                     if max_daily_loss_pct is not None and self._session and total_portfolio_usd > 0:
                         start_value = self._session.get_portfolio_start_value()
@@ -379,6 +408,22 @@ class TradingEngine:
                     state["last_action"] = "SELL"
 
             elif value <= base_value - step:
+                # Safe Live Mode check
+                if not self._is_trading_allowed():
+                    self._block_trade(product_id, "fixed_step BUY")
+                    continue
+                # Anti-churn check
+                churn_reason = self._check_anti_churn(product_id, strategy)
+                if churn_reason:
+                    msg = (
+                        f"Trade geblockt für {product_id}: "
+                        f"{'Cooldown läuft noch' if churn_reason == 'cooldown' else 'Max. Trades/Stunde erreicht'}."
+                    )
+                    logger.debug(msg)
+                    self._on_event("limit_blocked", {
+                        "reason": churn_reason, "message": msg, "product_id": product_id,
+                    })
+                    continue
                 # Position-limit check for BUY (only when limit is configured)
                 if max_position_pct is not None and total_portfolio_usd > 0:
                     max_coin_value = total_portfolio_usd * float(max_position_pct) / 100.0
@@ -444,6 +489,7 @@ class TradingEngine:
                 "Fixed-Step Trade ausgeführt: %s %s %.6f @ %.4f",
                 side, product_id, base_size, current_price,
             )
+            self._record_anti_churn_trade(product_id)
             self._on_event("order_placed", {
                 "side": side,
                 "product_id": product_id,
@@ -464,6 +510,11 @@ class TradingEngine:
 
     def manual_buy(self, product_id: str, base_size: str) -> dict:
         logger.info("Manual BUY %s %s", base_size, product_id)
+        if not self._is_trading_allowed():
+            self._block_trade(product_id, "manual_buy")
+            raise RuntimeError(
+                "Live-Trading nicht freigegeben. Setze 'live_trading_armed=true' oder verwende Sandbox."
+            )
         result = self._client.place_market_order(product_id, "BUY", base_size)
         self._on_event("order_placed", {
             "side": "BUY", "product_id": product_id,
@@ -477,6 +528,11 @@ class TradingEngine:
 
     def manual_sell(self, product_id: str, base_size: str) -> dict:
         logger.info("Manual SELL %s %s", base_size, product_id)
+        if not self._is_trading_allowed():
+            self._block_trade(product_id, "manual_sell")
+            raise RuntimeError(
+                "Live-Trading nicht freigegeben. Setze 'live_trading_armed=true' oder verwende Sandbox."
+            )
         result = self._client.place_market_order(product_id, "SELL", base_size)
         self._on_event("order_placed", {
             "side": "SELL", "product_id": product_id,
@@ -498,6 +554,87 @@ class TradingEngine:
     # Config update (hot-reload from GUI)
     # ------------------------------------------------------------------
 
-    def update_config(self, new_config: dict):
+    def update_config(self, new_config: dict, coinbase_config: Optional[dict] = None):
         self._config = new_config
+        if coinbase_config is not None:
+            self._coinbase_config = coinbase_config
+
+    # ------------------------------------------------------------------
+    # Safe Live Mode helpers
+    # ------------------------------------------------------------------
+
+    def _is_trading_allowed(self) -> bool:
+        """
+        Returns True when a trade may be executed:
+          - sandbox mode (use_sandbox=True), OR
+          - live mode AND live_trading_armed=True
+        """
+        use_sandbox = self._coinbase_config.get("use_sandbox", False)
+        armed = self._config.get("live_trading_armed", False)
+        return bool(use_sandbox or armed)
+
+    def _block_trade(self, product_id: str, context: str = ""):
+        """Fire trade_blocked_safety event and log a warning."""
+        msg = (
+            f"Trade blockiert (Safe-Live-Mode): Live-Trading nicht freigegeben. "
+            f"Setze 'live_trading_armed=true' oder verwende Sandbox. "
+            f"{'(' + context + ')' if context else ''}"
+        ).strip()
+        logger.warning(msg)
+        self._on_event("trade_blocked_safety", {"product_id": product_id, "message": msg})
+
+    # ------------------------------------------------------------------
+    # Anti-churn helpers
+    # ------------------------------------------------------------------
+
+    def _check_anti_churn(self, product_id: str, strategy: dict) -> Optional[str]:
+        """
+        Check cooldown and rate-limit for a coin.
+        Returns None if trading is allowed, or a reason string if blocked.
+        """
+        now = time.time()
+        cooldown = int(strategy.get("cooldown_seconds", 60))
+        max_per_hour = int(strategy.get("max_trades_per_hour", 6))
+
+        timestamps = self._trade_timestamps.setdefault(product_id, deque())
+
+        # Remove timestamps older than 1 hour
+        cutoff = now - 3600
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.popleft()
+
+        # Cooldown: time since last trade
+        if timestamps:
+            last_trade = timestamps[-1]
+            elapsed = now - last_trade
+            if elapsed < cooldown:
+                return "cooldown"
+
+        # Rate limit: number of trades in last hour
+        if len(timestamps) >= max_per_hour:
+            return "rate_limit"
+
+        return None
+
+    def _record_anti_churn_trade(self, product_id: str):
+        """Record a trade timestamp for anti-churn tracking."""
+        timestamps = self._trade_timestamps.setdefault(product_id, deque())
+        timestamps.append(time.time())
+
+    def get_cooldown_remaining(self, product_id: str, strategy: dict) -> float:
+        """Return seconds remaining in cooldown for a coin (0 if not in cooldown)."""
+        timestamps = self._trade_timestamps.get(product_id)
+        if not timestamps:
+            return 0.0
+        cooldown = int(strategy.get("cooldown_seconds", 60))
+        elapsed = time.time() - timestamps[-1]
+        return max(0.0, cooldown - elapsed)
+
+    def get_trades_last_hour(self, product_id: str) -> int:
+        """Return number of trades recorded in the last hour for a coin."""
+        timestamps = self._trade_timestamps.get(product_id)
+        if not timestamps:
+            return 0
+        cutoff = time.time() - 3600
+        return sum(1 for t in timestamps if t >= cutoff)
 

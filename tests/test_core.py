@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from collections import deque
 from unittest.mock import MagicMock, patch
 
 # Make sure src/ is importable
@@ -160,7 +161,8 @@ class TestTradingEngine(unittest.TestCase):
             "pairs": [],
         }
         collected = events if events is not None else []
-        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)))
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
         return engine, client, collected
 
     def test_initial_state_inactive(self):
@@ -444,7 +446,7 @@ class TestTradingEngineAutoTrade(unittest.TestCase):
         sess = SessionManager(sessions_file=os.path.join(tmpdir, "s.json"))
         sess.start_session()
         engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)),
-                               session_manager=sess)
+                               session_manager=sess, coinbase_config={"use_sandbox": True})
         return engine, client, collected, sess
 
     def test_auto_buy_on_price_drop(self):
@@ -638,7 +640,8 @@ class TestTradingEngineFixedSteps(unittest.TestCase):
             "coin_strategies": strategies,
         }
         collected = events if events is not None else []
-        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)))
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
         return engine, client, collected
 
     def _coin(self, product_id, balance, price_usd):
@@ -793,7 +796,8 @@ class TestTradingEngineFixedStepsNewFields(unittest.TestCase):
             "coin_strategies": strategies,
         }
         collected = events if events is not None else []
-        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)))
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
         return engine, client, collected
 
     def _coin(self, product_id, balance, price_usd):
@@ -892,7 +896,8 @@ class TestTradingEngineFixedStepsNewFields(unittest.TestCase):
             "max_position_percent": 10.0,  # very tight limit
         }
         events = []
-        engine = TradingEngine(client, cfg, on_event=lambda t, d: events.append((t, d)))
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: events.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
 
         # total = 24.5, limit = 2.45; coin + step = 25.0 > 2.45 → blocked
         coin = {"currency": "BTC", "balance": 0.1, "price_usd": 245.0,
@@ -904,6 +909,309 @@ class TestTradingEngineFixedStepsNewFields(unittest.TestCase):
         limit_events = [e for e in events if e[0] == "limit_blocked"]
         self.assertTrue(len(limit_events) > 0)
 
+
+# =============================================================================
+# Safe Live Mode tests
+# =============================================================================
+
+class TestSafeLiveMode(unittest.TestCase):
+    def _make_engine(self, use_sandbox=False, live_trading_armed=False,
+                     mode="fixed_steps", events=None):
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        cfg = {
+            "mode": mode,
+            "check_interval_seconds": 9999,
+            "live_trading_armed": live_trading_armed,
+            "auto_trade_enabled": True,
+            "threshold_percent": 5.0,
+            "order_size_percent": 10.0,
+            "pairs": [],
+            "coin_strategies": [
+                {"product_id": "BTC-USD", "base_value": 25.0, "step": 0.5, "enabled": True}
+            ],
+        }
+        collected = events if events is not None else []
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)),
+                               coinbase_config={"use_sandbox": use_sandbox})
+        return engine, client, collected
+
+    def _btc_coin(self, price):
+        return {"currency": "BTC", "balance": 0.1, "price_usd": price,
+                "value_usd": 0.1 * price, "product_id": "BTC-USD"}
+
+    # --- fixed_steps mode ---
+
+    def test_live_unarmed_blocks_fixed_step_trade(self):
+        """Live mode without armed flag must block all fixed-step trades."""
+        engine, client, events = self._make_engine(use_sandbox=False, live_trading_armed=False)
+        coin = self._btc_coin(255.0)  # value=25.5 >= base+step → SELL trigger
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        client.place_market_order.assert_not_called()
+        blocked = [e for e in events if e[0] == "trade_blocked_safety"]
+        self.assertTrue(len(blocked) > 0, "Expected trade_blocked_safety event")
+
+    def test_live_armed_allows_fixed_step_trade(self):
+        """Live mode WITH armed flag must allow fixed-step trades."""
+        engine, client, events = self._make_engine(use_sandbox=False, live_trading_armed=True)
+        client.place_market_order.return_value = {"order_id": "x"}
+        coin = self._btc_coin(255.0)  # value=25.5 >= base+step → SELL trigger
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls), "Expected SELL order")
+
+    def test_sandbox_allows_fixed_step_trade_without_armed(self):
+        """Sandbox mode must allow trades even without live_trading_armed."""
+        engine, client, events = self._make_engine(use_sandbox=True, live_trading_armed=False)
+        client.place_market_order.return_value = {"order_id": "y"}
+        coin = self._btc_coin(255.0)
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls))
+
+    # --- manual trade ---
+
+    def test_live_unarmed_blocks_manual_buy(self):
+        """manual_buy raises RuntimeError in live unarmed mode."""
+        engine, client, events = self._make_engine(use_sandbox=False, live_trading_armed=False)
+        with self.assertRaises(RuntimeError):
+            engine.manual_buy("BTC-USD", "0.001")
+        blocked = [e for e in events if e[0] == "trade_blocked_safety"]
+        self.assertTrue(len(blocked) > 0)
+
+    def test_live_unarmed_blocks_manual_sell(self):
+        """manual_sell raises RuntimeError in live unarmed mode."""
+        engine, client, events = self._make_engine(use_sandbox=False, live_trading_armed=False)
+        with self.assertRaises(RuntimeError):
+            engine.manual_sell("BTC-USD", "0.001")
+
+    def test_sandbox_allows_manual_buy(self):
+        """manual_buy succeeds in sandbox mode."""
+        engine, client, events = self._make_engine(use_sandbox=True, live_trading_armed=False)
+        client.place_market_order.return_value = {"order_id": "m1"}
+        result = engine.manual_buy("BTC-USD", "0.001")
+        self.assertEqual(result["order_id"], "m1")
+
+    # --- threshold mode ---
+
+    def test_live_unarmed_blocks_auto_trade_threshold_mode(self):
+        """Auto-trade in threshold mode is blocked in live unarmed mode."""
+        engine, client, events = self._make_engine(
+            use_sandbox=False, live_trading_armed=False, mode="threshold_percent")
+        coin = {"currency": "BTC", "balance": 1.0, "price_usd": 100.0,
+                "value_usd": 100.0, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+        coin2 = {**coin, "price_usd": 115.0, "value_usd": 115.0}
+        client.get_owned_coins_with_prices.return_value = [coin2]
+        engine._tick()
+
+        client.place_market_order.assert_not_called()
+        blocked = [e for e in events if e[0] == "trade_blocked_safety"]
+        self.assertTrue(len(blocked) > 0)
+
+
+# =============================================================================
+# Anti-Churn (cooldown + rate limit) tests
+# =============================================================================
+
+class TestAntiChurn(unittest.TestCase):
+    def _make_engine(self, strategy_extra=None, events=None):
+        from trading_engine import TradingEngine
+        strategy = {"product_id": "BTC-USD", "base_value": 25.0, "step": 0.5, "enabled": True}
+        if strategy_extra:
+            strategy.update(strategy_extra)
+        client = MagicMock()
+        cfg = {
+            "mode": "fixed_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": [strategy],
+        }
+        collected = events if events is not None else []
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: collected.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
+        return engine, client, collected
+
+    def _btc_sell_coin(self):
+        return {"currency": "BTC", "balance": 0.1, "price_usd": 255.0,
+                "value_usd": 25.5, "product_id": "BTC-USD"}
+
+    def test_cooldown_blocks_second_trade(self):
+        """After a trade, a second trade within cooldown_seconds is blocked."""
+        events = []
+        engine, client, events = self._make_engine(
+            strategy_extra={"cooldown_seconds": 3600, "max_trades_per_hour": 100})
+        client.place_market_order.return_value = {"order_id": "c1"}
+        coin = self._btc_sell_coin()
+        client.get_owned_coins_with_prices.return_value = [coin]
+
+        # First trade goes through
+        engine._tick()
+        self.assertEqual(client.place_market_order.call_count, 1)
+        client.place_market_order.reset_mock()
+
+        # Reset last_action so SELL is not blocked by anti-oscillation
+        engine._coin_states["BTC-USD"]["last_action"] = "SELL"
+
+        # Second trade within cooldown → blocked
+        engine._tick()
+        client.place_market_order.assert_not_called()
+        cooldown_events = [e for e in events if e[0] == "limit_blocked"
+                           and e[1].get("reason") == "cooldown"]
+        self.assertTrue(len(cooldown_events) > 0, "Expected cooldown limit_blocked event")
+
+    def test_rate_limit_blocks_trade(self):
+        """After max_trades_per_hour trades, further trades are blocked."""
+        events = []
+        engine, client, events = self._make_engine(
+            strategy_extra={"cooldown_seconds": 0, "max_trades_per_hour": 2})
+        client.place_market_order.return_value = {"order_id": "r1"}
+
+        # Manually inject 2 trade timestamps (fills the rate-limit bucket)
+        import time
+        engine._trade_timestamps["BTC-USD"] = deque(
+            [time.time() - 10, time.time() - 5])
+
+        # Reset state so trade logic is not blocked by anti-oscillation
+        engine._coin_states["BTC-USD"] = {"last_action": "SELL"}
+
+        coin = self._btc_sell_coin()
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        client.place_market_order.assert_not_called()
+        rate_events = [e for e in events if e[0] == "limit_blocked"
+                       and e[1].get("reason") == "rate_limit"]
+        self.assertTrue(len(rate_events) > 0, "Expected rate_limit limit_blocked event")
+
+    def test_cooldown_allows_trade_after_expiry(self):
+        """Trade is allowed after cooldown has expired."""
+        events = []
+        engine, client, events = self._make_engine(
+            strategy_extra={"cooldown_seconds": 1, "max_trades_per_hour": 100})
+        client.place_market_order.return_value = {"order_id": "e1"}
+
+        # Inject a timestamp 2 seconds ago (cooldown=1s → expired)
+        import time
+        engine._trade_timestamps["BTC-USD"] = deque([time.time() - 2])
+        engine._coin_states["BTC-USD"] = {"last_action": "SELL"}
+
+        coin = self._btc_sell_coin()
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls), "Expected SELL after cooldown")
+
+    def test_get_cooldown_remaining(self):
+        """get_cooldown_remaining returns correct remaining seconds."""
+        engine, _, _ = self._make_engine(strategy_extra={"cooldown_seconds": 60})
+        import time
+        engine._trade_timestamps["BTC-USD"] = deque([time.time() - 10])
+        strategy = {"cooldown_seconds": 60}
+        remaining = engine.get_cooldown_remaining("BTC-USD", strategy)
+        self.assertAlmostEqual(remaining, 50.0, delta=1.0)
+
+    def test_get_trades_last_hour(self):
+        """get_trades_last_hour counts recent trades."""
+        engine, _, _ = self._make_engine()
+        import time
+        engine._trade_timestamps["BTC-USD"] = deque(
+            [time.time() - 100, time.time() - 200, time.time() - 7200])  # 2 recent, 1 old
+        count = engine.get_trades_last_hour("BTC-USD")
+        self.assertEqual(count, 2)
+
+
+# =============================================================================
+# GET /strategies/effective API tests
+# =============================================================================
+
+class TestStrategiesEffectiveEndpoint(unittest.TestCase):
+    def setUp(self):
+        import api_server
+        api_server._engine = None
+        api_server._config = None
+        api_server._session = None
+        api_server._event_log.clear()
+        self._app = api_server.app.test_client()
+        self._app.testing = True
+
+    def test_strategies_effective_no_config(self):
+        import api_server
+        api_server._config = None
+        resp = self._app.get("/strategies/effective")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertEqual(data["strategies"], [])
+
+    def test_strategies_effective_returns_entries(self):
+        import api_server
+        from unittest.mock import MagicMock
+        mock_config = MagicMock()
+        mock_config.get_section.side_effect = lambda s: {
+            "trading": {
+                "coin_strategies": [
+                    {"product_id": "BTC-USD", "base_value": 25.0, "step": 0.5,
+                     "enabled": True, "cooldown_seconds": 60, "max_trades_per_hour": 6},
+                ]
+            }
+        }.get(s, {})
+        api_server._config = mock_config
+        api_server._engine = None
+
+        resp = self._app.get("/strategies/effective")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertEqual(len(data["strategies"]), 1)
+        s = data["strategies"][0]
+        self.assertEqual(s["product_id"], "BTC-USD")
+        self.assertEqual(s["base_value"], 25.0)
+        self.assertEqual(s["step"], 0.5)
+        self.assertTrue(s["enabled"])
+        self.assertEqual(s["cooldown_seconds"], 60)
+        self.assertEqual(s["max_trades_per_hour"], 6)
+        self.assertIsNone(s["last_action"])
+        self.assertEqual(s["cooldown_remaining"], 0.0)
+        self.assertEqual(s["trades_last_hour"], 0)
+        self.assertAlmostEqual(s["next_sell_trigger"], 25.5)
+        self.assertAlmostEqual(s["next_buy_trigger"], 24.5)
+
+    def test_strategies_effective_with_engine_state(self):
+        import api_server
+        import time
+        from unittest.mock import MagicMock
+        from trading_engine import TradingEngine
+
+        mock_config = MagicMock()
+        strategies = [
+            {"product_id": "ETH-USD", "base_value": 10.0, "step": 1.0,
+             "enabled": True, "cooldown_seconds": 30, "max_trades_per_hour": 4},
+        ]
+        mock_config.get_section.side_effect = lambda s: {
+            "trading": {"coin_strategies": strategies}
+        }.get(s, {})
+        api_server._config = mock_config
+
+        client = MagicMock()
+        cfg = {"mode": "fixed_steps", "coin_strategies": strategies}
+        engine = TradingEngine(client, cfg, coinbase_config={"use_sandbox": True})
+        engine._coin_states["ETH-USD"] = {"last_action": "BUY"}
+        engine._trade_timestamps["ETH-USD"] = deque(
+            [time.time() - 10])
+        api_server._engine = engine
+
+        resp = self._app.get("/strategies/effective")
+        data = json.loads(resp.data)
+        s = data["strategies"][0]
+        self.assertEqual(s["last_action"], "BUY")
+        self.assertEqual(s["trades_last_hour"], 1)
+        self.assertGreater(s["cooldown_remaining"], 0)
 
 if __name__ == "__main__":
     unittest.main()

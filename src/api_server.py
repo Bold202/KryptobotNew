@@ -188,6 +188,73 @@ def sessions_current():
     return jsonify({"session": _session.get_current()})
 
 
+@app.route("/strategies/effective")
+def strategies_effective():
+    """
+    Returns the effective (runtime) state for each configured coin strategy.
+
+    Response format:
+    {
+      "strategies": [
+        {
+          "product_id": "BTC-USD",
+          "enabled": true,
+          "base_value": 25.0,
+          "step": 0.5,
+          "cooldown_seconds": 60,
+          "max_trades_per_hour": 6,
+          "last_action": "BUY" | "SELL" | null,
+          "cooldown_remaining": 0.0,
+          "trades_last_hour": 1,
+          "next_sell_trigger": 25.5,
+          "next_buy_trigger": 24.5
+        },
+        ...
+      ]
+    }
+    """
+    if _config is None:
+        return jsonify({"strategies": []})
+
+    trading_cfg = _config.get_section("trading")
+    coin_strategies = trading_cfg.get("coin_strategies", [])
+
+    result = []
+    for s in coin_strategies:
+        product_id = s.get("product_id", "")
+        base_value = float(s.get("base_value", s.get("base_value_usd", 25.0)))
+        step = float(s.get("step", s.get("step_usd", 0.5)))
+        enabled = bool(s.get("enabled", True))
+        cooldown_seconds = int(s.get("cooldown_seconds", 60))
+        max_trades_per_hour = int(s.get("max_trades_per_hour", 6))
+
+        last_action = None
+        cooldown_remaining = 0.0
+        trades_last_hour = 0
+
+        if _engine is not None:
+            state = _engine._coin_states.get(product_id, {})
+            last_action = state.get("last_action")
+            cooldown_remaining = round(_engine.get_cooldown_remaining(product_id, s), 1)
+            trades_last_hour = _engine.get_trades_last_hour(product_id)
+
+        result.append({
+            "product_id": product_id,
+            "enabled": enabled,
+            "base_value": base_value,
+            "step": step,
+            "cooldown_seconds": cooldown_seconds,
+            "max_trades_per_hour": max_trades_per_hour,
+            "last_action": last_action,
+            "cooldown_remaining": cooldown_remaining,
+            "trades_last_hour": trades_last_hour,
+            "next_sell_trigger": round(base_value + step, 6),
+            "next_buy_trigger": round(base_value - step, 6),
+        })
+
+    return jsonify({"strategies": result})
+
+
 # -----------------------------------------------------------------------
 # Server thread
 # -----------------------------------------------------------------------

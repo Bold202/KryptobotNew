@@ -107,6 +107,7 @@ def main():
             config=config.get_section("trading"),
             on_event=_placeholder,
             session_manager=session_mgr,
+            coinbase_config=coinbase_cfg,
         )
     else:
         session_mgr = None
