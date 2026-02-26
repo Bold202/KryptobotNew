@@ -48,6 +48,10 @@ class TradingEngine:
     def is_active(self) -> bool:
         return self._active
 
+    @property
+    def use_sandbox(self) -> bool:
+        return getattr(self._client, "use_sandbox", False)
+
     def start(self):
         """Start the monitoring loop in a background thread."""
         with self._lock:
@@ -86,7 +90,8 @@ class TradingEngine:
     def _tick(self):
         """One monitoring cycle."""
         coins = self._client.get_owned_coins_with_prices()
-        self.portfolio_snapshot = coins
+        with self._lock:
+            self.portfolio_snapshot = list(coins)
         self._on_event("portfolio_update", {"coins": coins})
 
         threshold = float(self._config.get("threshold_percent", 2.0))
