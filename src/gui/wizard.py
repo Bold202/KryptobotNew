@@ -232,14 +232,30 @@ class SetupWizard:
         if self._step == 1:
             key = getattr(self, "_api_key_var", None)
             secret = getattr(self, "_api_secret_var", None)
-            if key and not key.get().strip():
+            key_val = key.get().strip() if key else ""
+            secret_val = secret.get().strip() if secret else ""
+            if not key_val and not secret_val:
+                # Allow proceeding without credentials – runs in demo mode
+                answer = messagebox.askyesno(
+                    "Kein API-Schlüssel",
+                    "Es wurden keine API-Zugangsdaten eingegeben.\n\n"
+                    "KryptoBot läuft dann im Demo-Modus:\n"
+                    "  • Keine Verbindung zu Coinbase\n"
+                    "  • Kein automatischer oder manueller Handel\n"
+                    "  • Portfolio-Anzeige nicht verfügbar\n\n"
+                    "Sie können die Zugangsdaten später in den Einstellungen hinterlegen.\n\n"
+                    "Trotzdem fortfahren?",
+                    parent=self.window,
+                )
+                return answer
+            if key and not key_val:
                 messagebox.showwarning(
                     "Fehlende Eingabe",
                     "Bitte geben Sie Ihren Coinbase API-Schlüssel ein.",
                     parent=self.window,
                 )
                 return False
-            if secret and not secret.get().strip():
+            if secret and not secret_val:
                 messagebox.showwarning(
                     "Fehlende Eingabe",
                     "Bitte geben Sie Ihren Coinbase API-Secret ein.",

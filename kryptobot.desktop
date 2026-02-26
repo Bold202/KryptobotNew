@@ -4,8 +4,7 @@ Type=Application
 Name=KryptoBot
 GenericName=Coinbase Crypto Assistant
 Comment=Überwacht Krypto-Kurse und handelt automatisch über Coinbase
-Exec=bash -c "source $HOME/KryptobotNew/.venv/bin/activate && python3 $HOME/KryptobotNew/src/main.py"
-Icon=$HOME/KryptobotNew/assets/icon.png
+Exec=bash -c "appdir=\"${KRYPTOBOT_DIR:-$HOME/KryptobotNew}\"; source \"$appdir/.venv/bin/activate\" && python3 \"$appdir/src/main.py\""
 Terminal=false
 Categories=Finance;
 StartupNotify=true

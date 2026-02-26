@@ -404,9 +404,14 @@ class MainWindow:
             return
         size = self._trade_size_var.get().strip()
         action = "kaufen" if side == "BUY" else "verkaufen"
+        is_sandbox = getattr(self._engine, "use_sandbox", False)
+        if is_sandbox:
+            warning_text = "Dies ist ein SIMULIERTER Marktauftrag (Sandbox/Testmodus)."
+        else:
+            warning_text = "Dies ist ein echter Marktauftrag!"
         if not messagebox.askyesno(
             "Auftrag bestätigen",
-            f"{size} {pair} {action}?\n\nDies ist ein echter Marktauftrag!",
+            f"{size} {pair} {action}?\n\n{warning_text}",
         ):
             return
 

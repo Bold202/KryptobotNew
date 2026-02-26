@@ -34,6 +34,7 @@ class CoinbaseClient:
     def __init__(self, api_key: str, api_secret: str, use_sandbox: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.use_sandbox = use_sandbox
         self.base_url = SANDBOX_URL if use_sandbox else BASE_URL
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
@@ -182,33 +183,59 @@ class CoinbaseClient:
         USD price.  Each entry: {currency, balance, price_usd, value_usd}.
         """
         accounts = self.get_accounts()
-        result = []
+        result: List[dict] = []
+
+        # Separate fiat/stablecoin accounts from crypto accounts
+        fiat_currencies = ("USD", "USDC", "USDT", "EUR", "GBP")
+        crypto_accounts = [acc for acc in accounts if acc["currency"] not in fiat_currencies]
+
+        # Fetch all crypto prices in a single batch request
+        product_ids = [f"{acc['currency']}-USD" for acc in crypto_accounts]
+        price_map: Dict[str, float] = {}
+        if product_ids:
+            try:
+                raw = self.get_best_bid_ask(product_ids)
+                # Response shape: {"pricebooks": [{"product_id": ..., "bids": [...], "asks": [...]}]}
+                for entry in raw.get("pricebooks", []):
+                    pid = entry.get("product_id")
+                    if not pid:
+                        continue
+                    # Use best ask as the current price (what you'd pay to buy)
+                    asks = entry.get("asks", [])
+                    bids = entry.get("bids", [])
+                    price_str = (
+                        (asks[0].get("price") if asks else None)
+                        or (bids[0].get("price") if bids else None)
+                    )
+                    try:
+                        price_map[pid] = float(price_str or 0)
+                    except (ValueError, TypeError):
+                        price_map[pid] = 0.0
+            except CoinbaseAPIError:
+                pass  # Fall back to 0 prices below
+
         for acc in accounts:
             currency = acc["currency"]
-            if currency in ("USD", "USDC", "USDT", "EUR", "GBP"):
-                # Fiat / stablecoin – value equals balance
+            balance = acc["balance"]
+            if currency in fiat_currencies:
                 result.append(
                     {
                         "currency": currency,
-                        "balance": acc["balance"],
+                        "balance": balance,
                         "price_usd": 1.0,
-                        "value_usd": acc["balance"],
+                        "value_usd": balance,
                         "product_id": None,
                     }
                 )
                 continue
             product_id = f"{currency}-USD"
-            try:
-                prod = self.get_product(product_id)
-                price = float(prod.get("price", 0) or 0)
-            except (CoinbaseAPIError, ValueError, TypeError):
-                price = 0.0
+            price = price_map.get(product_id, 0.0)
             result.append(
                 {
                     "currency": currency,
-                    "balance": acc["balance"],
+                    "balance": balance,
                     "price_usd": price,
-                    "value_usd": acc["balance"] * price,
+                    "value_usd": balance * price,
                     "product_id": product_id,
                 }
             )

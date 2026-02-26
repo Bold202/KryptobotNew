@@ -47,7 +47,7 @@ def add_event(event_type: str, data: dict):
     """Called by the trading engine callback to populate the event log."""
     import datetime
     _event_log.appendleft(
-        {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), "type": event_type, "data": data}
+        {"ts": datetime.datetime.now().astimezone().isoformat(), "type": event_type, "data": data}
     )
 
 

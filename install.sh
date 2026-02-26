@@ -21,7 +21,7 @@ echo ""
 # --------------------------------------------------------------------------
 require_apt() {
     local pkg="$1"
-    if ! dpkg -l "$pkg" &>/dev/null; then
+    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
         echo "▶ Installiere $pkg …"
         sudo apt-get install -y "$pkg"
     fi
@@ -47,7 +47,6 @@ if [ -d "$INSTALL_DIR/.git" ]; then
     cd "$INSTALL_DIR"
     git fetch origin
     git reset --hard "origin/$BRANCH"
-    git pull origin "$BRANCH" --rebase
 else
     echo "▶ Klone Repository nach $INSTALL_DIR …"
     git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
