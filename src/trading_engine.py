@@ -109,7 +109,7 @@ class TradingEngine:
         self._on_event("portfolio_update", {"coins": coins})
 
         mode = self._config.get("mode", "threshold_percent")
-        if mode == "fixed_eur_steps":
+        if mode in ("fixed_eur_steps", "fixed_steps"):
             self._tick_fixed_eur_steps(coins)
         else:
             self._tick_threshold(coins)
@@ -299,27 +299,43 @@ class TradingEngine:
           - value <= base_value - step                           → BUY step worth
 
         After a BUY, further SELLs are blocked until a SELL occurs first.
+
+        Field names: 'base_value'/'step' (preferred) or 'base_value_usd'/'step_usd' (legacy).
+        Entries with enabled=False are skipped.
         """
         coin_map = {c.get("product_id"): c for c in coins if c.get("product_id")}
         strategies = self._config.get("coin_strategies", [])
+
+        # Portfolio total for security-limit checks (mirrors threshold mode)
+        total_portfolio_usd = sum(c.get("value_usd", 0.0) for c in coins)
+        if self._session:
+            self._session.set_portfolio_start_value(total_portfolio_usd)
+
+        # Security limits – only applied when explicitly set in config
+        max_daily_loss_pct = self._config.get("max_daily_loss_percent")
+        max_position_pct = self._config.get("max_position_percent")
 
         for strategy in strategies:
             product_id = strategy.get("product_id")
             if not product_id:
                 continue
-            base_value = float(strategy.get("base_value_usd", 25.0))
-            step = float(strategy.get("step_usd", 0.5))
+            # Respect per-coin enabled flag (default True for backward compat)
+            if not strategy.get("enabled", True):
+                continue
+            # Support both 'base_value' (preferred) and legacy 'base_value_usd'
+            base_value = float(strategy.get("base_value", strategy.get("base_value_usd", 25.0)))
+            # Support both 'step' (preferred) and legacy 'step_usd'
+            step = float(strategy.get("step", strategy.get("step_usd", 0.5)))
 
             coin = coin_map.get(product_id)
             if coin is None:
                 continue
 
             current_price = float(coin.get("price_usd", 0.0))
-            balance = float(coin.get("balance", 0.0))
             if current_price <= 0:
                 continue
 
-            value = balance * current_price
+            value = float(coin.get("value_usd", 0.0))
             state = self._coin_states.setdefault(product_id, {"last_action": None})
             last_action = state.get("last_action")
 
@@ -329,18 +345,71 @@ class TradingEngine:
             )
 
             if value >= base_value + step:
-                # Sell only if the previous action was not a BUY (anti-oscillation lock)
-                if last_action != "BUY":
+                if last_action == "BUY":
+                    msg = (
+                        f"Fixed-Step SELL geblockt für {product_id}: "
+                        f"letzter Trade war BUY (anti-Oszillation)."
+                    )
+                    logger.debug(msg)
+                    self._on_event("limit_blocked", {
+                        "reason": "anti_oscillation", "message": msg, "product_id": product_id,
+                    })
+                else:
+                    # Daily-loss check (only when limit is configured)
+                    if max_daily_loss_pct is not None and self._session and total_portfolio_usd > 0:
+                        start_value = self._session.get_portfolio_start_value()
+                        if start_value and start_value > 0:
+                            loss_pct = (start_value - total_portfolio_usd) / start_value * 100.0
+                            if loss_pct >= float(max_daily_loss_pct):
+                                msg = (
+                                    f"Tagesverlust-Limit erreicht: Portfolio um {loss_pct:.1f}% "
+                                    f"gefallen (Limit: {max_daily_loss_pct:.1f}%). "
+                                    f"Kein Auto-Trade für {product_id}."
+                                )
+                                logger.warning(msg)
+                                self._on_event("limit_blocked", {
+                                    "reason": "max_daily_loss", "message": msg,
+                                    "product_id": product_id,
+                                })
+                                continue
                     base_size = step / current_price
                     self._execute_fixed_step_trade(
                         product_id, "SELL", base_size, current_price, value, base_value, step,
                     )
                     state["last_action"] = "SELL"
-                else:
-                    logger.debug(
-                        "fixed_step %s: SELL geblockt (last_action=BUY)", product_id,
-                    )
+
             elif value <= base_value - step:
+                # Position-limit check for BUY (only when limit is configured)
+                if max_position_pct is not None and total_portfolio_usd > 0:
+                    max_coin_value = total_portfolio_usd * float(max_position_pct) / 100.0
+                    if value + step > max_coin_value:
+                        msg = (
+                            f"Positions-Limit erreicht für {product_id}: "
+                            f"Position ({value:.2f} USD) bereits bei "
+                            f"{max_position_pct:.0f}% Limit."
+                        )
+                        logger.warning(msg)
+                        self._on_event("limit_blocked", {
+                            "reason": "max_position", "message": msg, "product_id": product_id,
+                        })
+                        continue
+                # Daily-loss check (only when limit is configured)
+                if max_daily_loss_pct is not None and self._session and total_portfolio_usd > 0:
+                    start_value = self._session.get_portfolio_start_value()
+                    if start_value and start_value > 0:
+                        loss_pct = (start_value - total_portfolio_usd) / start_value * 100.0
+                        if loss_pct >= float(max_daily_loss_pct):
+                            msg = (
+                                f"Tagesverlust-Limit erreicht: Portfolio um {loss_pct:.1f}% "
+                                f"gefallen (Limit: {max_daily_loss_pct:.1f}%). "
+                                f"Kein Auto-Trade für {product_id}."
+                            )
+                            logger.warning(msg)
+                            self._on_event("limit_blocked", {
+                                "reason": "max_daily_loss", "message": msg,
+                                "product_id": product_id,
+                            })
+                            continue
                 base_size = step / current_price
                 self._execute_fixed_step_trade(
                     product_id, "BUY", base_size, current_price, value, base_value, step,

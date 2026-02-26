@@ -207,7 +207,7 @@ class MainWindow:
         _mode_combo = ttk.Combobox(
             row1,
             textvariable=self._mode_var,
-            values=["threshold_percent", "fixed_eur_steps"],
+            values=["threshold_percent", "fixed_eur_steps", "fixed_steps"],
             state="readonly",
             width=18,
         )
@@ -575,12 +575,13 @@ class MainWindow:
         frame = tk.Frame(win, bg=BG_MID)
         frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 6))
 
-        cols = ("Handelspaar", "Basiswert (USD)", "Schrittgröße (USD)")
+        cols = ("Aktiv", "Handelspaar", "Basiswert (USD)", "Schrittgröße (USD)")
         tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
         for col in cols:
             tree.heading(col, text=col)
-            tree.column(col, width=180, anchor="center")
-        tree.column("Handelspaar", width=160)
+            tree.column(col, width=140, anchor="center")
+        tree.column("Aktiv", width=50)
+        tree.column("Handelspaar", width=140)
 
         scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
@@ -593,10 +594,14 @@ class MainWindow:
             for row in tree.get_children():
                 tree.delete(row)
             for s in strategies:
+                enabled = s.get("enabled", True)
+                base = s.get("base_value", s.get("base_value_usd", 25.0))
+                step = s.get("step", s.get("step_usd", 0.5))
                 tree.insert("", tk.END, values=(
+                    "✓" if enabled else "✗",
                     s.get("product_id", ""),
-                    f"{s.get('base_value_usd', 25.0):.2f}",
-                    f"{s.get('step_usd', 0.5):.4f}",
+                    f"{float(base):.2f}",
+                    f"{float(step):.4f}",
                 ))
 
         _refresh()
@@ -623,10 +628,21 @@ class MainWindow:
                      fg=TEXT_LIGHT, bg=BG_DARK).pack(pady=(12, 6))
             pid_var = _lbl_entry(dlg, "Handelspaar (z.B. BTC-USD):",
                                  initial.get("product_id", "") if initial else "")
-            base_var = _lbl_entry(dlg, "Basiswert (USD):",
-                                  str(initial.get("base_value_usd", 25.0)) if initial else "25.0")
-            step_var = _lbl_entry(dlg, "Schrittgröße (USD):",
-                                  str(initial.get("step_usd", 0.5)) if initial else "0.5")
+            if initial:
+                base_initial = initial.get("base_value", initial.get("base_value_usd", 25.0))
+                step_initial = initial.get("step", initial.get("step_usd", 0.5))
+                enabled_initial = initial.get("enabled", True)
+            else:
+                base_initial, step_initial, enabled_initial = 25.0, 0.5, True
+            base_var = _lbl_entry(dlg, "Basiswert (USD):", str(base_initial))
+            step_var = _lbl_entry(dlg, "Schrittgröße (USD):", str(step_initial))
+
+            # Aktiv-Checkbox
+            enabled_row = tk.Frame(dlg, bg=BG_DARK)
+            enabled_row.pack(fill=tk.X, padx=16, pady=4)
+            tk.Label(enabled_row, text="Aktiv:", fg=TEXT_LIGHT, bg=BG_DARK, width=22, anchor="w").pack(side=tk.LEFT)
+            enabled_var = tk.BooleanVar(value=enabled_initial)
+            ttk.Checkbutton(enabled_row, variable=enabled_var).pack(side=tk.LEFT, padx=4)
 
             def _ok():
                 try:
@@ -638,8 +654,9 @@ class MainWindow:
                     if base <= 0 or step <= 0:
                         raise ValueError("Basiswert und Schrittgröße müssen positiv sein.")
                     result["product_id"] = pid
-                    result["base_value_usd"] = base
-                    result["step_usd"] = step
+                    result["base_value"] = base
+                    result["step"] = step
+                    result["enabled"] = enabled_var.get()
                     dlg.destroy()
                 except ValueError as exc:
                     messagebox.showerror("Ungültige Eingabe", str(exc), parent=dlg)
