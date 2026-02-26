@@ -1291,5 +1291,380 @@ class TestAIAnalyst(unittest.TestCase):
         self.assertEqual(call_args[0][0], "ETH-USD")
 
 
+# =============================================================================
+# TradingEngine – Profitability Check tests
+# =============================================================================
+
+class TestProfitabilityCheck(unittest.TestCase):
+    def _make_engine(self, extra_cfg=None):
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        # Default: get_best_bid_ask returns empty pricebooks → spread = 0
+        client.get_best_bid_ask.return_value = {"pricebooks": []}
+        cfg = {
+            "mode": "fixed_eur_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": [],
+            "live_trading_armed": True,
+            "profitability_check_enabled": True,
+            "round_trip_fee_percent": 1.2,
+        }
+        if extra_cfg:
+            cfg.update(extra_cfg)
+        events = []
+        engine = TradingEngine(client, cfg, on_event=lambda t, d: events.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
+        return engine, client, events
+
+    def test_profitable_when_move_exceeds_fee(self):
+        engine, _, _ = self._make_engine()
+        ok, reason = engine._check_profitability("BTC-USD", 5.0, 100.0)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    def test_unprofitable_when_move_below_fee(self):
+        engine, _, _ = self._make_engine()
+        ok, reason = engine._check_profitability("BTC-USD", 0.5, 100.0)
+        self.assertFalse(ok)
+        self.assertIn("unprofitabel", reason)
+        self.assertIn("BTC-USD", reason)
+
+    def test_spread_increases_required_move(self):
+        engine, client, _ = self._make_engine()
+        # Simulate a 1 % spread (bid=99, ask=101, mid=100)
+        client.get_best_bid_ask.return_value = {
+            "pricebooks": [
+                {
+                    "product_id": "BTC-USD",
+                    "bids": [{"price": "99.0"}],
+                    "asks": [{"price": "101.0"}],
+                }
+            ]
+        }
+        # move = 1.5 % < fee 1.2 % + spread 2.0 % = 3.2 %
+        ok, reason = engine._check_profitability("BTC-USD", 1.5, 100.0)
+        self.assertFalse(ok)
+        self.assertIn("Spread", reason)
+
+    def test_check_disabled_always_allows(self):
+        engine, _, _ = self._make_engine({"profitability_check_enabled": False})
+        ok, reason = engine._check_profitability("BTC-USD", 0.0, 100.0)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    def test_profitability_blocks_auto_trade_buy(self):
+        """Auto-trade BUY blocked when expected move < fee."""
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        client.get_best_bid_ask.return_value = {"pricebooks": []}
+        cfg = {
+            "auto_trade_enabled": True,
+            "live_trading_armed": True,
+            "threshold_percent": 0.5,  # trigger at 0.5 %
+            "check_interval_seconds": 9999,
+            "pairs": ["BTC-USD"],
+            "round_trip_fee_percent": 1.2,   # > 0.5 % → unprofitable
+            "profitability_check_enabled": True,
+            "order_size_percent": 1.0,
+            "max_position_percent": 100.0,  # disable position limit for this test
+        }
+        events = []
+        engine = TradingEngine(client, cfg,
+                               on_event=lambda t, d: events.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
+        usd_coin = {"currency": "USD", "balance": 1000.0, "price_usd": 1.0,
+                    "value_usd": 1000.0, "product_id": None}
+        btc_coin = {"currency": "BTC", "balance": 0.01, "price_usd": 100.0,
+                    "value_usd": 1.0, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [usd_coin, btc_coin]
+        engine._tick()  # sets reference price
+
+        # price drops 0.8 % → change_pct = -0.8 < -0.5 threshold → auto buy triggered
+        # but 0.8 % < fee 1.2 % → unprofitable → blocked
+        btc2 = {**btc_coin, "price_usd": 99.2, "value_usd": 0.992}
+        client.get_owned_coins_with_prices.return_value = [usd_coin, btc2]
+        engine._tick()
+
+        client.place_market_order.assert_not_called()
+        blocked = [e for e in events if e[0] == "limit_blocked"
+                   and e[1].get("reason") == "unprofitable"]
+        self.assertTrue(len(blocked) > 0, "Expected unprofitable limit_blocked event")
+
+    def test_fixed_step_trade_blocked_when_step_too_small(self):
+        """Fixed-step trade blocked when step/base_value < fee."""
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        client.get_best_bid_ask.return_value = {"pricebooks": []}
+        client.place_market_order.return_value = {"order_id": "x"}
+        # step = 0.1, base = 100 → expected_move = 0.1 % < fee 1.2 % → blocked
+        strategy = {"product_id": "BTC-USD", "base_value": 100.0, "step": 0.1, "enabled": True}
+        cfg = {
+            "mode": "fixed_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": [strategy],
+            "round_trip_fee_percent": 1.2,
+            "profitability_check_enabled": True,
+        }
+        events = []
+        engine = TradingEngine(client, cfg,
+                               on_event=lambda t, d: events.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
+        # value = 100.2 >= base + step = 100.1 → SELL would trigger
+        coin = {"currency": "BTC", "balance": 0.01, "price_usd": 10020.0,
+                "value_usd": 100.2, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+        client.place_market_order.assert_not_called()
+
+
+# =============================================================================
+# TradingEngine – Circuit Breaker tests
+# =============================================================================
+
+class TestCircuitBreaker(unittest.TestCase):
+    def _make_engine(self, extra_cfg=None):
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        client.get_best_bid_ask.return_value = {"pricebooks": []}
+        strategy = {"product_id": "BTC-USD", "base_value": 25.0, "step": 5.0, "enabled": True}
+        cfg = {
+            "mode": "fixed_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": [strategy],
+            "live_trading_armed": True,
+            "profitability_check_enabled": False,  # disable so only CB matters
+        }
+        if extra_cfg:
+            cfg.update(extra_cfg)
+        events = []
+        engine = TradingEngine(client, cfg,
+                               on_event=lambda t, d: events.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
+        return engine, client, events
+
+    def _buy_coin(self):
+        # value = 20.0 ≤ base(25) - step(5) = 20.0 → BUY trigger (edge)
+        return {"currency": "BTC", "balance": 0.1, "price_usd": 200.0,
+                "value_usd": 19.9, "product_id": "BTC-USD"}
+
+    def test_circuit_breaker_not_active_by_default(self):
+        engine, _, _ = self._make_engine()
+        self.assertFalse(engine.circuit_breaker_active)
+
+    def test_circuit_breaker_triggers_on_low_portfolio(self):
+        engine, client, events = self._make_engine(
+            {"circuit_breaker_min_portfolio_usd": 100.0}
+        )
+        coin = {"currency": "BTC", "balance": 0.1, "price_usd": 500.0,
+                "value_usd": 50.0, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+        self.assertTrue(engine.circuit_breaker_active)
+        cb_events = [e for e in events if e[0] == "circuit_breaker_triggered"]
+        self.assertEqual(len(cb_events), 1)
+        self.assertIn("total_portfolio_usd", cb_events[0][1])
+
+    def test_circuit_breaker_blocks_auto_buy(self):
+        engine, client, events = self._make_engine(
+            {"circuit_breaker_min_portfolio_usd": 100.0}
+        )
+        client.place_market_order.return_value = {"order_id": "b1"}
+        coin = self._buy_coin()
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+        # CB triggered (portfolio < 100) and BUY attempt blocked
+        client.place_market_order.assert_not_called()
+        cb_blocked = [e for e in events
+                      if e[0] == "limit_blocked" and e[1].get("reason") == "circuit_breaker"]
+        self.assertTrue(len(cb_blocked) > 0, "Expected circuit_breaker limit_blocked event")
+
+    def test_circuit_breaker_does_not_block_sell(self):
+        """Even with circuit breaker active, SELLs should still go through."""
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        client.get_best_bid_ask.return_value = {"pricebooks": []}
+        client.place_market_order.return_value = {"order_id": "s1"}
+        strategy = {"product_id": "BTC-USD", "base_value": 25.0, "step": 5.0, "enabled": True}
+        cfg = {
+            "mode": "fixed_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": [strategy],
+            "live_trading_armed": True,
+            "profitability_check_enabled": False,
+            "circuit_breaker_min_portfolio_usd": 100.0,  # always triggered
+        }
+        engine = TradingEngine(client, cfg, coinbase_config={"use_sandbox": True})
+        # value = 31 >= base(25) + step(5) = 30 → SELL
+        coin = {"currency": "BTC", "balance": 0.1, "price_usd": 310.0,
+                "value_usd": 31.0, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+        # SELL should still go through despite CB being active
+        calls = client.place_market_order.call_args_list
+        self.assertTrue(any(c[0][1] == "SELL" for c in calls), "Expected SELL despite circuit breaker")
+
+    def test_circuit_breaker_resets_when_portfolio_recovers(self):
+        engine, client, events = self._make_engine(
+            {"circuit_breaker_min_portfolio_usd": 100.0}
+        )
+        # First tick: low portfolio → trigger CB
+        low_coin = {"currency": "BTC", "balance": 0.1, "price_usd": 500.0,
+                    "value_usd": 50.0, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [low_coin]
+        engine._tick()
+        self.assertTrue(engine.circuit_breaker_active)
+
+        # Second tick: portfolio recovers
+        high_coin = {**low_coin, "price_usd": 2000.0, "value_usd": 200.0}
+        client.get_owned_coins_with_prices.return_value = [high_coin]
+        engine._tick()
+        self.assertFalse(engine.circuit_breaker_active)
+        reset_events = [e for e in events if e[0] == "circuit_breaker_reset"]
+        self.assertEqual(len(reset_events), 1)
+
+    def test_circuit_breaker_fires_once_not_repeatedly(self):
+        engine, client, events = self._make_engine(
+            {"circuit_breaker_min_portfolio_usd": 100.0}
+        )
+        low_coin = {"currency": "BTC", "balance": 0.1, "price_usd": 500.0,
+                    "value_usd": 50.0, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [low_coin]
+        engine._tick()
+        engine._tick()
+        engine._tick()
+        cb_events = [e for e in events if e[0] == "circuit_breaker_triggered"]
+        self.assertEqual(len(cb_events), 1, "circuit_breaker_triggered should fire only once")
+
+
+# =============================================================================
+# TradingEngine – Reserve Pool & Reinvestment tests
+# =============================================================================
+
+class TestReservePool(unittest.TestCase):
+    def _make_engine(self, extra_cfg=None):
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        client.get_best_bid_ask.return_value = {"pricebooks": []}
+        client.place_market_order.return_value = {"order_id": "t1"}
+        strategy = {"product_id": "BTC-USD", "base_value": 25.0, "step": 5.0, "enabled": True}
+        cfg = {
+            "mode": "fixed_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": [strategy],
+            "live_trading_armed": True,
+            "profitability_check_enabled": False,
+            "reinvest_fraction": 0.25,
+        }
+        if extra_cfg:
+            cfg.update(extra_cfg)
+        events = []
+        engine = TradingEngine(client, cfg,
+                               on_event=lambda t, d: events.append((t, d)),
+                               coinbase_config={"use_sandbox": True})
+        return engine, client, events
+
+    def test_pool_starts_at_zero(self):
+        engine, _, _ = self._make_engine()
+        self.assertEqual(engine.reserve_pool_usd, 0.0)
+
+    def test_sell_fills_reserve_pool(self):
+        engine, client, events = self._make_engine()
+        # value = 31 >= base(25) + step(5) = 30 → SELL
+        coin = {"currency": "BTC", "balance": 0.1, "price_usd": 310.0,
+                "value_usd": 31.0, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+        # 75% of step (5 USD) goes to pool = 3.75 USD
+        self.assertGreater(engine.reserve_pool_usd, 0.0)
+        pool_events = [e for e in events if e[0] == "reserve_pool_updated"]
+        self.assertEqual(len(pool_events), 1)
+        self.assertAlmostEqual(pool_events[0][1]["pool_amount_added"], 5.0 * 0.75, places=4)
+
+    def test_pool_used_for_buy(self):
+        engine, client, events = self._make_engine()
+        # Seed the pool manually
+        engine._reserve_pool_usd = 10.0
+        # value = 19.9 ≤ base(25) - step(5) = 20 → BUY
+        coin = {"currency": "BTC", "balance": 0.1, "price_usd": 199.0,
+                "value_usd": 19.9, "product_id": "BTC-USD"}
+        client.get_owned_coins_with_prices.return_value = [coin]
+        engine._tick()
+        # Pool should be drawn from
+        self.assertLess(engine.reserve_pool_usd, 10.0)
+        pool_used_events = [e for e in events if e[0] == "reserve_pool_used"]
+        self.assertEqual(len(pool_used_events), 1)
+
+    def test_apply_reinvestment_splits_correctly(self):
+        engine, _, _ = self._make_engine({"reinvest_fraction": 0.3})
+        engine._apply_reinvestment("BTC-USD", 100.0)
+        # 70% to pool, 30% to coin reinvest_accumulated
+        self.assertAlmostEqual(engine.reserve_pool_usd, 70.0)
+        state = engine._coin_states.get("BTC-USD", {})
+        self.assertAlmostEqual(state.get("reinvest_accumulated", 0.0), 30.0)
+
+
+# =============================================================================
+# TradingEngine – State persistence tests
+# =============================================================================
+
+class TestStatePersistence(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._state_file = os.path.join(self._tmpdir.name, "trading_state.json")
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _make_engine(self, extra_cfg=None):
+        from trading_engine import TradingEngine
+        client = MagicMock()
+        client.get_best_bid_ask.return_value = {"pricebooks": []}
+        cfg = {
+            "mode": "fixed_steps",
+            "check_interval_seconds": 9999,
+            "coin_strategies": [],
+            "live_trading_armed": True,
+            "profitability_check_enabled": False,
+            "state_file": self._state_file,
+        }
+        if extra_cfg:
+            cfg.update(extra_cfg)
+        engine = TradingEngine(client, cfg, coinbase_config={"use_sandbox": True})
+        return engine, client
+
+    def test_save_and_load_state(self):
+        engine, _ = self._make_engine()
+        engine._reserve_pool_usd = 42.5
+        engine._coin_states["BTC-USD"] = {"last_action": "SELL", "reinvest_accumulated": 5.0}
+        engine._active = True  # Allow save
+        engine._save_state()
+        engine._active = False
+
+        # Create new engine and load state
+        engine2, _ = self._make_engine()
+        engine2._load_state()
+        self.assertAlmostEqual(engine2.reserve_pool_usd, 42.5)
+        self.assertEqual(engine2._coin_states["BTC-USD"]["last_action"], "SELL")
+
+    def test_save_skipped_when_inactive(self):
+        engine, _ = self._make_engine()
+        engine._reserve_pool_usd = 99.0
+        engine._active = False
+        engine._save_state()  # Should not write (engine not active)
+        self.assertFalse(os.path.exists(self._state_file))
+
+    def test_load_state_tolerates_missing_file(self):
+        engine, _ = self._make_engine()
+        engine._load_state()  # Should not raise even if file doesn't exist
+        self.assertEqual(engine.reserve_pool_usd, 0.0)
+
+    def test_load_state_tolerates_corrupt_file(self):
+        with open(self._state_file, "w") as f:
+            f.write("not-valid-json{{{{")
+        engine, _ = self._make_engine()
+        engine._load_state()  # Should not raise
+        self.assertEqual(engine.reserve_pool_usd, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

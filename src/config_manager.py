@@ -30,6 +30,12 @@ DEFAULTS = {
         "max_daily_loss_percent": 5.0,
         "live_trading_armed": False,
         "coin_strategies": [],
+        "round_trip_fee_percent": 1.2,
+        "profitability_check_enabled": True,
+        "reinvest_fraction": 0.25,
+        "circuit_breaker_min_portfolio_usd": None,
+        "circuit_breaker_min_fiat_usd": None,
+        "min_pool_use_usd": 1.0,
     },
     "api": {
         "enabled": True,
