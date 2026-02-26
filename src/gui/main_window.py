@@ -28,11 +28,12 @@ RED = "#ff4757"
 class MainWindow:
     """The primary application window."""
 
-    def __init__(self, root: tk.Tk, config, engine=None, client=None):
+    def __init__(self, root: tk.Tk, config, engine=None, client=None, session_manager=None):
         self._root = root
         self._config = config
         self._engine = engine
         self._client = client
+        self._session = session_manager  # Sitzungsverwaltung
 
         self._setup_window()
         self._build_ui()
@@ -44,15 +45,15 @@ class MainWindow:
 
     def _setup_window(self):
         self._root.title("KryptoBot – Coinbase Assistent")
-        self._root.geometry("900x620")
-        self._root.minsize(700, 480)
+        self._root.geometry("960x720")
+        self._root.minsize(800, 560)
         self._root.configure(bg=BG_DARK)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Center
         self._root.update_idletasks()
-        x = (self._root.winfo_screenwidth() - 900) // 2
-        y = (self._root.winfo_screenheight() - 620) // 2
+        x = (self._root.winfo_screenwidth() - 960) // 2
+        y = (self._root.winfo_screenheight() - 720) // 2
         self._root.geometry(f"+{x}+{y}")
 
         # Style
@@ -262,6 +263,9 @@ class MainWindow:
             command=self._on_sell,
         ).pack(side=tk.LEFT)
 
+        # --- Session analysis ---
+        self._build_session_panel(right)
+
         # --- Event log ---
         tk.Label(
             right,
@@ -287,6 +291,140 @@ class MainWindow:
         log_scroll = ttk.Scrollbar(log_frame, command=self._log_text.yview)
         self._log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _build_session_panel(self, parent):
+        """Bereich 'Heutige Sitzung' mit Echtzeit-Analyse."""
+        header_row = tk.Frame(parent, bg=BG_DARK)
+        header_row.pack(fill=tk.X, pady=(4, 0))
+
+        tk.Label(
+            header_row,
+            text="Heutige Sitzung",
+            font=("Helvetica", 12, "bold"),
+            fg=TEXT_LIGHT,
+            bg=BG_DARK,
+        ).pack(side=tk.LEFT, anchor="w")
+
+        tk.Button(
+            header_row,
+            text="📋 Sitzungs-Historie",
+            font=("Helvetica", 9),
+            bg=BG_CARD,
+            fg=TEXT_LIGHT,
+            relief=tk.FLAT,
+            cursor="hand2",
+            padx=6,
+            command=self._show_session_history,
+        ).pack(side=tk.RIGHT)
+
+        sess_frame = tk.Frame(parent, bg=BG_MID, relief=tk.FLAT, bd=1, padx=12, pady=8)
+        sess_frame.pack(fill=tk.X, pady=(4, 8))
+
+        def _row(label_text, var):
+            row = tk.Frame(sess_frame, bg=BG_MID)
+            row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=label_text, fg=TEXT_DIM, bg=BG_MID, width=28, anchor="w",
+                     font=("Helvetica", 9)).pack(side=tk.LEFT)
+            tk.Label(row, textvariable=var, fg=TEXT_LIGHT, bg=BG_MID,
+                     font=("Helvetica", 9, "bold")).pack(side=tk.LEFT)
+
+        self._sess_status_var = tk.StringVar(value="–")
+        self._sess_auto_trades_var = tk.StringVar(value="0")
+        self._sess_manual_trades_var = tk.StringVar(value="0")
+        self._sess_volume_var = tk.StringVar(value="0.00 USD")
+        self._sess_pnl_var = tk.StringVar(value="0.00 USD")
+
+        _row("Engine-Status:", self._sess_status_var)
+        _row("Automatische Trades:", self._sess_auto_trades_var)
+        _row("Manuelle Trades:", self._sess_manual_trades_var)
+        _row("Gehandeltes Volumen:", self._sess_volume_var)
+        _row("Geschätzter Gewinn/Verlust:", self._sess_pnl_var)
+
+    def _update_session_display(self):
+        """Aktualisiert die Sitzungsanzeige aus dem SessionManager."""
+        if self._session is None:
+            return
+        data = self._session.get_current()
+        if data is None:
+            self._sess_auto_trades_var.set("0")
+            self._sess_manual_trades_var.set("0")
+            self._sess_volume_var.set("0.00 USD")
+            self._sess_pnl_var.set("0.00 USD")
+            return
+
+        self._sess_auto_trades_var.set(str(data.get("auto_trades_count", 0)))
+        self._sess_manual_trades_var.set(str(data.get("manual_trades_count", 0)))
+
+        # Gesamtvolumen über alle Paare summieren
+        volume = sum(data.get("volume_traded", {}).values())
+        self._sess_volume_var.set(f"{volume:.2f} USD")
+
+        pnl = data.get("pnl_estimate", 0.0)
+        color = GREEN if pnl >= 0 else RED
+        sign = "+" if pnl >= 0 else ""
+        self._sess_pnl_var.set(f"{sign}{pnl:.2f} USD")
+
+    def _show_session_history(self):
+        """Öffnet ein Fenster mit der Sitzungshistorie."""
+        if self._session is None:
+            import tkinter.messagebox as mb
+            mb.showinfo("Sitzungs-Historie", "Kein Sitzungsmanager verfügbar.")
+            return
+
+        history = self._session.get_history()
+        win = tk.Toplevel(self._root)
+        win.title("KryptoBot – Sitzungs-Historie")
+        win.geometry("680x400")
+        win.configure(bg=BG_DARK)
+        win.grab_set()
+
+        tk.Label(win, text="Letzte Sitzungen", font=("Helvetica", 13, "bold"),
+                 fg=TEXT_LIGHT, bg=BG_DARK).pack(pady=(12, 4))
+
+        cols = ("Start", "Ende", "Auto-Trades", "Manuelle Trades", "Volumen (USD)", "Ergebnis (USD)")
+        frame = tk.Frame(win, bg=BG_MID)
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=100, anchor="center")
+        tree.column("Start", width=150)
+        tree.column("Ende", width=150)
+
+        def _fmt_time(iso):
+            if not iso:
+                return "–"
+            try:
+                import datetime as dt
+                t = dt.datetime.fromisoformat(iso)
+                return t.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                return iso[:16]
+
+        for sess in history:
+            volume = sum(sess.get("volume_traded", {}).values())
+            pnl = sess.get("pnl_estimate", 0.0)
+            sign = "+" if pnl >= 0 else ""
+            tree.insert("", tk.END, values=(
+                _fmt_time(sess.get("start_time")),
+                _fmt_time(sess.get("end_time")),
+                sess.get("auto_trades_count", 0),
+                sess.get("manual_trades_count", 0),
+                f"{volume:.2f}",
+                f"{sign}{pnl:.2f}",
+            ))
+
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        if not history:
+            tk.Label(win, text="Keine abgeschlossenen Sitzungen vorhanden.",
+                     fg=TEXT_DIM, bg=BG_DARK).pack(pady=8)
+
+        ttk.Button(win, text="Schließen", command=win.destroy).pack(pady=(0, 10))
 
     def _build_status_bar(self):
         bar = tk.Frame(self._root, bg=BG_CARD, height=24)
@@ -440,6 +578,16 @@ class MainWindow:
         elif event_type == "engine_stopped":
             self._update_toggle_state(False)
             self._log("■ Trading-Automatik gestoppt.")
+            self._update_session_display()
+        elif event_type == "session_started":
+            self._update_session_display()
+            auto = self._config.get_section("trading").get("auto_trade_enabled", False)
+            sandbox = self._config.get_section("coinbase").get("use_sandbox", False)
+            status = f"Automatik AN  |  Auto-Trade: {'JA' if auto else 'NEIN'}  |  Sandbox: {'JA' if sandbox else 'NEIN'}"
+            self._sess_status_var.set(status)
+        elif event_type == "session_ended":
+            self._sess_status_var.set("Automatik AUS")
+            self._update_session_display()
         elif event_type == "threshold_reached":
             pid = data.get("product_id")
             pct = data.get("change_pct", 0)
@@ -447,8 +595,15 @@ class MainWindow:
                 f"🔔 Schwellenwert erreicht: {pid}  {pct:+.2f}%  "
                 f"(Ref: {data.get('ref_price'):.4f} → Jetzt: {data.get('current_price'):.4f})"
             )
+        elif event_type == "auto_trade_decision":
+            self._log(f"🤖 Auto-Trade: {data.get('message', '')}")
         elif event_type == "order_placed":
-            self._log(f"✅ Auftrag ausgeführt: {data.get('side')} {data.get('product_id')}")
+            side_label = "Kauf" if data.get("side") == "BUY" else "Verkauf"
+            auto_label = " (automatisch)" if data.get("is_auto") else " (manuell)"
+            self._log(f"✅ Auftrag ausgeführt: {side_label} {data.get('product_id')}{auto_label}")
+            self._update_session_display()
+        elif event_type == "limit_blocked":
+            self._log(f"🚫 Limit-Sperre: {data.get('message', '')}")
         elif event_type == "error":
             self._log(f"❌ Fehler: {data.get('message')}")
 
@@ -481,6 +636,11 @@ class MainWindow:
             self._update_toggle_state(True)
         else:
             self._update_toggle_state(False)
+
+        # Sitzungsstatus initialisieren
+        sandbox = self._config.get_section("coinbase").get("use_sandbox", False)
+        self._sess_status_var.set(f"Automatik AUS  |  Sandbox: {'JA' if sandbox else 'NEIN'}")
+        self._update_session_display()
 
         # Greet
         self._log("🚀 KryptoBot gestartet. Portfolio laden, um zu beginnen.")

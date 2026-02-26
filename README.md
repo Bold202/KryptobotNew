@@ -63,6 +63,10 @@ Beim ersten Start wird sie automatisch aus `config.example.json` erstellt.
 | `trading.threshold_percent`             | Kursabweichung (%) die einen Handel auslöst        |
 | `trading.check_interval_seconds`        | Prüfintervall in Sekunden                          |
 | `trading.pairs`                         | Liste der Handelspaare (z. B. `["BTC-USD"]`)       |
+| `trading.auto_trade_enabled`            | `true` = Bot handelt vollautomatisch               |
+| `trading.order_size_percent`            | Auftragsgröße in % des Portfolios je Trade         |
+| `trading.max_position_percent`          | Max. Anteil des Portfolios je Coin (%)             |
+| `trading.max_daily_loss_percent`        | Stopp-Schwelle: max. Tagesverlust in % des Portfolios |
 | `api.enabled`                           | REST-API für externe Integrationen aktivieren      |
 | `api.port`                              | REST-API Port (Standard: `8080`)                   |
 
@@ -72,18 +76,20 @@ Beim ersten Start wird sie automatisch aus `config.example.json` erstellt.
 
 Wenn die API aktiviert ist, lauscht sie auf Port 8080 (konfigurierbar).
 
-| Methode | Endpunkt            | Beschreibung                                   |
-|---------|---------------------|------------------------------------------------|
-| GET     | `/status`           | Bot-Status + Portfolio-Snapshot                |
-| GET     | `/portfolio`        | Liste der gehaltenen Coins mit Kursen          |
-| GET     | `/engine`           | Trading-Automatik aktiv/inaktiv                |
-| POST    | `/engine/start`     | Trading-Automatik starten                      |
-| POST    | `/engine/stop`      | Trading-Automatik stoppen                      |
-| GET     | `/events?n=50`      | Letzte N Ereignisse (Log)                      |
-| GET     | `/config`           | Aktuelle Konfiguration (API-Keys versteckt)    |
-| POST    | `/config`           | Trading-Einstellungen aktualisieren            |
-| POST    | `/trade/buy`        | Manuellen Markt-Kauf ausführen                 |
-| POST    | `/trade/sell`       | Manuellen Markt-Verkauf ausführen              |
+| Methode | Endpunkt              | Beschreibung                                   |
+|---------|-----------------------|------------------------------------------------|
+| GET     | `/status`             | Bot-Status + Portfolio-Snapshot                |
+| GET     | `/portfolio`          | Liste der gehaltenen Coins mit Kursen          |
+| GET     | `/engine`             | Trading-Automatik aktiv/inaktiv                |
+| POST    | `/engine/start`       | Trading-Automatik starten                      |
+| POST    | `/engine/stop`        | Trading-Automatik stoppen                      |
+| GET     | `/events?n=50`        | Letzte N Ereignisse (Log)                      |
+| GET     | `/config`             | Aktuelle Konfiguration (API-Keys versteckt)    |
+| POST    | `/config`             | Trading-Einstellungen aktualisieren            |
+| POST    | `/trade/buy`          | Manuellen Markt-Kauf ausführen                 |
+| POST    | `/trade/sell`         | Manuellen Markt-Verkauf ausführen              |
+| GET     | `/sessions`           | Liste vergangener Sitzungen (neueste zuerst)   |
+| GET     | `/sessions/current`   | Aktuelle laufende Sitzung (oder `null`)        |
 
 ### Home Assistant Sensor Beispiel
 
@@ -112,6 +118,7 @@ KryptobotNew/
 │   ├── config_manager.py   # Konfigurations-Verwaltung (~/.kryptobot/config.json)
 │   ├── coinbase_client.py  # Coinbase Advanced Trade API Client
 │   ├── trading_engine.py   # Kursüberwachung & Auto-Handel
+│   ├── session_manager.py  # Sitzungsverfolgung & -persistenz (~/.kryptobot/sessions.json)
 │   ├── api_server.py       # REST API Server (Flask)
 │   └── gui/
 │       ├── main_window.py  # Hauptfenster (tkinter)

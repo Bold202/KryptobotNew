@@ -100,15 +100,21 @@ def main():
 
     if client:
         from trading_engine import TradingEngine
+        from session_manager import SessionManager
+        session_mgr = SessionManager()
         engine = TradingEngine(
             client=client,
             config=config.get_section("trading"),
             on_event=_placeholder,
+            session_manager=session_mgr,
         )
+    else:
+        session_mgr = None
 
     # ------------------------------------------------------------------ main window
     root.deiconify()
-    app = MainWindow(root, config, engine=engine, client=client)
+    app = MainWindow(root, config, engine=engine, client=client,
+                     session_manager=session_mgr if client else None)
 
     # Wire the engine callback to the GUI now that the window exists
     if engine:
@@ -124,7 +130,7 @@ def main():
     if api_cfg.get("enabled", False):
         try:
             import api_server
-            api_server.init(engine, config)
+            api_server.init(engine, config, session_manager=session_mgr if client else None)
             api_server.start_server(
                 host=api_cfg.get("host", "0.0.0.0"),
                 port=int(api_cfg.get("port", 8080)),

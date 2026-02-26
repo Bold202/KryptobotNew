@@ -23,6 +23,10 @@ DEFAULTS = {
         "threshold_percent": 2.0,
         "check_interval_seconds": 60,
         "pairs": [],
+        "auto_trade_enabled": False,
+        "order_size_percent": 5.0,
+        "max_position_percent": 50.0,
+        "max_daily_loss_percent": 5.0,
     },
     "api": {
         "enabled": True,

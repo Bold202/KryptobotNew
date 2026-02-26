@@ -193,6 +193,32 @@ class SetupWizard:
         )
         self._entry(self._pairs_var)
 
+        # Automatischer Handel
+        self._auto_trade_var = tk.BooleanVar(value=trading_cfg.get("auto_trade_enabled", False))
+        ttk.Checkbutton(
+            self._content,
+            text="Automatischen Handel aktivieren (Bot handelt selbstständig)",
+            variable=self._auto_trade_var,
+        ).pack(anchor="w", pady=(8, 2))
+
+        self._label("Auftragsgröße (% des Portfolios pro Trade):")
+        self._order_size_var = tk.StringVar(
+            value=str(trading_cfg.get("order_size_percent", 5.0))
+        )
+        self._entry(self._order_size_var)
+
+        self._label("Max. Positionsgröße (% des Portfolios je Coin):")
+        self._max_position_var = tk.StringVar(
+            value=str(trading_cfg.get("max_position_percent", 50.0))
+        )
+        self._entry(self._max_position_var)
+
+        self._label("Max. Tagesverlust (% des Portfolios, dann Stopp):")
+        self._max_loss_var = tk.StringVar(
+            value=str(trading_cfg.get("max_daily_loss_percent", 5.0))
+        )
+        self._entry(self._max_loss_var)
+
     def _step_3(self):
         """API server settings."""
         api_cfg = self._config.get_section("api")
@@ -257,6 +283,22 @@ class SetupWizard:
             except ValueError:
                 messagebox.showerror("Ungültige Eingabe", "Intervall muss eine ganze Zahl sein.", parent=self.window)
                 return False
+            for field, label in [
+                ("_order_size_var", "Auftragsgröße"),
+                ("_max_position_var", "Max. Positionsgröße"),
+                ("_max_loss_var", "Max. Tagesverlust"),
+            ]:
+                try:
+                    val = float(getattr(self, field, tk.StringVar()).get())
+                    if val <= 0 or val > 100:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror(
+                        "Ungültige Eingabe",
+                        f"{label} muss eine Zahl zwischen 0 und 100 sein.",
+                        parent=self.window,
+                    )
+                    return False
         if self._step == 3:
             try:
                 int(getattr(self, "_api_port_var", tk.StringVar()).get())
@@ -284,6 +326,10 @@ class SetupWizard:
                     "threshold_percent": float(self._threshold_var.get()),
                     "check_interval_seconds": int(self._interval_var.get()),
                     "pairs": pairs,
+                    "auto_trade_enabled": self._auto_trade_var.get(),
+                    "order_size_percent": float(self._order_size_var.get()),
+                    "max_position_percent": float(self._max_position_var.get()),
+                    "max_daily_loss_percent": float(self._max_loss_var.get()),
                 },
             )
         elif self._step == 3:
