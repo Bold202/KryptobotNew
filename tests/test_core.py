@@ -1213,5 +1213,83 @@ class TestStrategiesEffectiveEndpoint(unittest.TestCase):
         self.assertEqual(s["trades_last_hour"], 1)
         self.assertGreater(s["cooldown_remaining"], 0)
 
+
+# =============================================================================
+# AIAnalyst tests
+# =============================================================================
+
+class TestAIAnalyst(unittest.TestCase):
+    def _make_analyst(self, candles):
+        from ai_analyst import AIAnalyst
+        client = MagicMock()
+        client.get_candles.return_value = candles
+        return AIAnalyst(client), client
+
+    def _candles(self, closes):
+        return [{"close": str(c)} for c in closes]
+
+    def test_returns_expected_keys(self):
+        analyst, _ = self._make_analyst(self._candles([100.0, 102.0, 98.0, 101.0]))
+        result = analyst.analyze_market("BTC-USD")
+        for key in ("base_value", "step", "cooldown_seconds", "reason",
+                    "volatility_pct", "std_dev", "candles_analyzed"):
+            self.assertIn(key, result)
+
+    def test_base_value_is_last_close(self):
+        """base_value equals the first (most recent) close price."""
+        analyst, _ = self._make_analyst(self._candles([105.0, 100.0, 95.0]))
+        result = analyst.analyze_market("BTC-USD")
+        self.assertAlmostEqual(result["base_value"], 105.0, places=2)
+
+    def test_candles_analyzed_count(self):
+        candles = self._candles([10.0] * 24)
+        analyst, _ = self._make_analyst(candles)
+        result = analyst.analyze_market("BTC-USD")
+        self.assertEqual(result["candles_analyzed"], 24)
+
+    def test_step_at_least_half_percent_of_base(self):
+        """step is never less than 0.5 % of base_value."""
+        # Zero std_dev (flat price)
+        analyst, _ = self._make_analyst(self._candles([200.0] * 10))
+        result = analyst.analyze_market("BTC-USD")
+        self.assertGreaterEqual(result["step"], result["base_value"] * 0.005)
+
+    def test_high_volatility_short_cooldown(self):
+        """Volatility > 3 % → cooldown = 300 s."""
+        closes = [100.0 + (i % 2) * 20.0 for i in range(20)]
+        analyst, _ = self._make_analyst(self._candles(closes))
+        result = analyst.analyze_market("BTC-USD")
+        if result["volatility_pct"] > 3.0:
+            self.assertEqual(result["cooldown_seconds"], 300)
+
+    def test_low_volatility_long_cooldown(self):
+        """Volatility ≤ 1 % → cooldown = 1800 s."""
+        closes = [100.0 + i * 0.001 for i in range(24)]
+        analyst, _ = self._make_analyst(self._candles(closes))
+        result = analyst.analyze_market("BTC-USD")
+        if result["volatility_pct"] <= 1.0:
+            self.assertEqual(result["cooldown_seconds"], 1800)
+
+    def test_empty_candles_returns_error(self):
+        analyst, _ = self._make_analyst([])
+        result = analyst.analyze_market("BTC-USD")
+        self.assertIn("error", result)
+
+    def test_api_error_returns_error_dict(self):
+        from ai_analyst import AIAnalyst
+        from coinbase_client import CoinbaseAPIError
+        client = MagicMock()
+        client.get_candles.side_effect = CoinbaseAPIError("Not found", 404)
+        analyst = AIAnalyst(client)
+        result = analyst.analyze_market("INVALID-USD")
+        self.assertIn("error", result)
+
+    def test_get_candles_called_with_product_id(self):
+        analyst, client = self._make_analyst(self._candles([50.0, 51.0]))
+        analyst.analyze_market("ETH-USD")
+        call_args = client.get_candles.call_args
+        self.assertEqual(call_args[0][0], "ETH-USD")
+
+
 if __name__ == "__main__":
     unittest.main()
