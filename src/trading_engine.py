@@ -4,15 +4,19 @@ KryptoBot - Coinbase Crypto Assistant
 Trading Engine: monitors prices and executes trades when thresholds are met.
 """
 
+import json
 import logging
+import os
 import threading
 import time
 from collections import deque
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from coinbase_client import CoinbaseClient, CoinbaseAPIError
 
 logger = logging.getLogger(__name__)
+
+TRADING_STATE_FILE = os.path.join(os.path.expanduser("~"), ".kryptobot", "trading_state.json")
 
 
 class TradingEngine:
@@ -57,6 +61,11 @@ class TradingEngine:
         # Latest snapshot: list of {currency, balance, price_usd, value_usd, product_id}
         self.portfolio_snapshot: List[dict] = []
 
+        # Global reserve/liquidity pool (in USD, for dip purchases)
+        self._reserve_pool_usd: float = 0.0
+        # Circuit breaker state (blocks automatic BUYs below critical thresholds)
+        self._circuit_breaker_active: bool = False
+
     # ------------------------------------------------------------------
     # Control
     # ------------------------------------------------------------------
@@ -65,11 +74,23 @@ class TradingEngine:
     def is_active(self) -> bool:
         return self._active
 
+    @property
+    def reserve_pool_usd(self) -> float:
+        """Current balance of the global reserve/liquidity pool in USD."""
+        return self._reserve_pool_usd
+
+    @property
+    def circuit_breaker_active(self) -> bool:
+        """True when the circuit breaker is active (automatic buys paused)."""
+        return self._circuit_breaker_active
+
     def start(self):
         """Start the monitoring loop in a background thread."""
         with self._lock:
             if self._active:
                 return
+            # Zustand beim Start aus Datei laden (Restart-Toleranz)
+            self._load_state()
             self._active = True
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
@@ -113,6 +134,10 @@ class TradingEngine:
         coins = self._client.get_owned_coins_with_prices()
         self.portfolio_snapshot = coins
         self._on_event("portfolio_update", {"coins": coins})
+
+        # Circuit-Breaker-Prüfung (vor Modus-spezifischer Logik)
+        total_portfolio_usd = sum(c.get("value_usd", 0.0) for c in coins)
+        self._check_and_update_circuit_breaker(total_portfolio_usd, coins)
 
         mode = self._config.get("mode", "threshold_percent")
         if mode in ("fixed_eur_steps", "fixed_steps"):
@@ -229,6 +254,18 @@ class TradingEngine:
 
         if change_pct < 0:
             # Kurs gefallen → Kaufen
+            # Circuit-Breaker: Automatische Käufe gesperrt?
+            if self._circuit_breaker_active:
+                msg = (
+                    f"Circuit Breaker aktiv: Automatischer Kauf für {product_id} pausiert "
+                    f"(Portfolio unter Mindestschwelle)."
+                )
+                logger.warning(msg)
+                self._on_event("limit_blocked", {
+                    "reason": "circuit_breaker", "message": msg, "product_id": product_id,
+                })
+                return
+
             # Berechneter Kaufbetrag: X% des Gesamtportfolios in USD
             usd_to_spend = total_portfolio_usd * order_size_pct / 100.0
 
@@ -281,6 +318,15 @@ class TradingEngine:
             "message": decision_text,
         })
 
+        # Profitabilitätsprüfung
+        profitable, profit_reason = self._check_profitability(product_id, change_pct, current_price)
+        if not profitable:
+            logger.warning(profit_reason)
+            self._on_event("limit_blocked", {
+                "reason": "unprofitable", "message": profit_reason, "product_id": product_id,
+            })
+            return
+
         # Trade ausführen
         try:
             result = self._client.place_market_order(product_id, side, str(base_size))
@@ -297,6 +343,10 @@ class TradingEngine:
             # In Sitzung erfassen
             if self._session:
                 self._session.record_trade(side, product_id, base_size, current_price, is_auto=True)
+            # Reinvestment nach erfolgreichem Verkauf
+            if side == "SELL":
+                self._apply_reinvestment(product_id, base_size * current_price)
+            self._save_state()
         except Exception as exc:
             logger.error("Auto-Trade fehlgeschlagen für %s: %s", product_id, exc)
             self._on_event("error", {"message": f"Auto-Trade Fehler ({product_id}): {exc}"})
@@ -424,6 +474,17 @@ class TradingEngine:
                         "reason": churn_reason, "message": msg, "product_id": product_id,
                     })
                     continue
+                # Circuit-Breaker: Automatische Käufe gesperrt?
+                if self._circuit_breaker_active:
+                    msg = (
+                        f"Circuit Breaker aktiv: Automatischer Kauf für {product_id} pausiert "
+                        f"(Portfolio unter Mindestschwelle)."
+                    )
+                    logger.warning(msg)
+                    self._on_event("limit_blocked", {
+                        "reason": "circuit_breaker", "message": msg, "product_id": product_id,
+                    })
+                    continue
                 # Position-limit check for BUY (only when limit is configured)
                 if max_position_pct is not None and total_portfolio_usd > 0:
                     max_coin_value = total_portfolio_usd * float(max_position_pct) / 100.0
@@ -465,7 +526,25 @@ class TradingEngine:
                                   current_price: float, current_value: float,
                                   base_value: float, step: float):
         """Execute a single trade for the fixed-step strategy."""
+        # Profitabilitätsprüfung: Step muss Fees + Spread übertreffen
+        expected_move_pct = (step / base_value * 100.0) if base_value > 0 else 0.0
+        profitable, profit_reason = self._check_profitability(product_id, expected_move_pct, current_price)
+        if not profitable:
+            logger.warning(profit_reason)
+            self._on_event("limit_blocked", {
+                "reason": "unprofitable", "message": profit_reason, "product_id": product_id,
+            })
+            return
+
         usd_amount = base_size * current_price
+
+        # Reserve-Pool für Nachkäufe nutzen (nur bei BUY, z.B. Markteinbruch)
+        if side == "BUY":
+            pool_extra = self._maybe_use_liquidity_pool(product_id, usd_amount)
+            if pool_extra > 0:
+                base_size += pool_extra / current_price
+                usd_amount += pool_extra
+
         threshold = base_value + step if side == "SELL" else base_value - step
         op_sym = "≥" if side == "SELL" else "≤"
         action_word = "verkaufe" if side == "SELL" else "kaufe"
@@ -500,6 +579,10 @@ class TradingEngine:
             })
             if self._session:
                 self._session.record_trade(side, product_id, base_size, current_price, is_auto=True)
+            # Reinvestment nach erfolgreichem Verkauf
+            if side == "SELL":
+                self._apply_reinvestment(product_id, usd_amount, base_value)
+            self._save_state()
         except Exception as exc:
             logger.error("Fixed-Step Trade fehlgeschlagen für %s: %s", product_id, exc)
             self._on_event("error", {"message": f"Fixed-Step Trade Fehler ({product_id}): {exc}"})
@@ -515,6 +598,14 @@ class TradingEngine:
             raise RuntimeError(
                 "Live-Trading nicht freigegeben. Setze 'live_trading_armed=true' oder verwende Sandbox."
             )
+        # Profitabilitätsprüfung: Warnung bei manuellem Trade (kein Block)
+        price = self._get_price_from_snapshot(product_id)
+        profitable, profit_reason = self._check_profitability(product_id, 0.0, price)
+        if not profitable:
+            logger.warning("Manueller Kauf – Profitabilitätswarnung: %s", profit_reason)
+            self._on_event("unprofitable_trade_warning", {
+                "side": "BUY", "product_id": product_id, "message": profit_reason,
+            })
         result = self._client.place_market_order(product_id, "BUY", base_size)
         self._on_event("order_placed", {
             "side": "BUY", "product_id": product_id,
@@ -522,7 +613,6 @@ class TradingEngine:
         })
         if self._session:
             # Preis aus Portfolio-Snapshot holen, falls vorhanden
-            price = self._get_price_from_snapshot(product_id)
             self._session.record_trade("BUY", product_id, float(base_size), price, is_auto=False)
         return result
 
@@ -533,14 +623,26 @@ class TradingEngine:
             raise RuntimeError(
                 "Live-Trading nicht freigegeben. Setze 'live_trading_armed=true' oder verwende Sandbox."
             )
+        # Profitabilitätsprüfung: Warnung bei manuellem Trade (kein Block)
+        price = self._get_price_from_snapshot(product_id)
+        profitable, profit_reason = self._check_profitability(product_id, 0.0, price)
+        if not profitable:
+            logger.warning("Manueller Verkauf – Profitabilitätswarnung: %s", profit_reason)
+            self._on_event("unprofitable_trade_warning", {
+                "side": "SELL", "product_id": product_id, "message": profit_reason,
+            })
         result = self._client.place_market_order(product_id, "SELL", base_size)
         self._on_event("order_placed", {
             "side": "SELL", "product_id": product_id,
             "base_size": float(base_size), "is_auto": False, "result": result,
         })
         if self._session:
-            price = self._get_price_from_snapshot(product_id)
             self._session.record_trade("SELL", product_id, float(base_size), price, is_auto=False)
+        # Reinvestment nach erfolgreichem manuellen Verkauf
+        usd_value = float(base_size) * price
+        if usd_value > 0:
+            self._apply_reinvestment(product_id, usd_value)
+            self._save_state()
         return result
 
     def _get_price_from_snapshot(self, product_id: str) -> float:
@@ -637,4 +739,223 @@ class TradingEngine:
             return 0
         cutoff = time.time() - 3600
         return sum(1 for t in timestamps if t >= cutoff)
+
+    # ------------------------------------------------------------------
+    # State persistence (_load_state / _save_state)
+    # ------------------------------------------------------------------
+
+    def _load_state(self):
+        """Load persisted trading state from file (restart tolerance)."""
+        state_file = self._config.get("state_file", TRADING_STATE_FILE)
+        try:
+            if os.path.exists(state_file):
+                with open(state_file, "r") as fh:
+                    data = json.load(fh)
+                self._coin_states.update(data.get("coin_states", {}))
+                for pid, ts_list in data.get("trade_timestamps", {}).items():
+                    self._trade_timestamps[pid] = deque(ts_list)
+                self._reserve_pool_usd = float(data.get("reserve_pool_usd", 0.0))
+                logger.info(
+                    "Trading-Zustand geladen: %d Coins, Reserve-Pool: %.2f USD",
+                    len(self._coin_states), self._reserve_pool_usd,
+                )
+        except (json.JSONDecodeError, OSError, KeyError, ValueError) as exc:
+            logger.warning("Konnte Trading-Zustand nicht laden: %s", exc)
+
+    def _save_state(self):
+        """Persist trading state to disk (restart tolerance)."""
+        # Nur persistieren, wenn die Engine aktiv läuft (nicht bei direkten Testaufrufen)
+        if not self._active:
+            return
+        state_file = self._config.get("state_file", TRADING_STATE_FILE)
+        data = {
+            "coin_states": self._coin_states,
+            "trade_timestamps": {
+                pid: list(ts) for pid, ts in self._trade_timestamps.items()
+            },
+            "reserve_pool_usd": self._reserve_pool_usd,
+        }
+        try:
+            os.makedirs(os.path.dirname(state_file), exist_ok=True)
+            with open(state_file, "w") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError as exc:
+            logger.warning("Konnte Trading-Zustand nicht speichern: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Profitability check
+    # ------------------------------------------------------------------
+
+    def _get_spread_pct(self, product_id: str, current_price: float) -> float:
+        """Return the current bid/ask spread as a percentage of the mid price."""
+        try:
+            bba = self._client.get_best_bid_ask([product_id])
+            for pb in bba.get("pricebooks", []):
+                if pb.get("product_id") == product_id:
+                    bids = pb.get("bids", [])
+                    asks = pb.get("asks", [])
+                    if bids and asks:
+                        bid = float(bids[0].get("price", 0) or 0)
+                        ask = float(asks[0].get("price", 0) or 0)
+                        if bid > 0 and ask > 0:
+                            mid = (bid + ask) / 2.0
+                            return (ask - bid) / mid * 100.0
+        except Exception as exc:
+            logger.debug("Spread-Abfrage fehlgeschlagen für %s: %s", product_id, exc)
+        return 0.0
+
+    def _check_profitability(
+        self,
+        product_id: str,
+        expected_move_pct: float,
+        current_price: float,
+    ) -> Tuple[bool, str]:
+        """
+        Prüft ob ein automatischer Trade profitabel ist.
+
+        :param product_id:        z. B. 'BTC-USD'
+        :param expected_move_pct: erwarteter Kursmove in % (aus change_pct oder step/base*100)
+        :param current_price:     aktueller Preis (für Spread-Referenz)
+        :returns: (profitable, reason) – wenn nicht profitabel, enthält reason die Begründung.
+        """
+        if not self._config.get("profitability_check_enabled", True):
+            return True, ""
+
+        fee_pct = float(self._config.get("round_trip_fee_percent", 1.2))
+        spread_pct = self._get_spread_pct(product_id, current_price)
+        min_move = fee_pct + spread_pct
+
+        if abs(expected_move_pct) < min_move:
+            reason = (
+                f"Trade unprofitabel für {product_id}: "
+                f"Erwarteter Move {abs(expected_move_pct):.2f}% < "
+                f"Fees {fee_pct:.2f}% + Spread {spread_pct:.2f}% = {min_move:.2f}%"
+            )
+            return False, reason
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # Reserve-Pool & Reinvestment
+    # ------------------------------------------------------------------
+
+    def _apply_reinvestment(
+        self,
+        product_id: str,
+        usd_value: float,
+        config_base_value: float = 0.0,
+    ):
+        """
+        Splittet Verkaufserlöse:
+          - Ein konfigurierbarer Anteil (reinvest_fraction) wird als kumulierter
+            Reinvestitionsbetrag pro Coin verfolgt (für spätere Base-Anpassungen).
+          - Der Rest fließt in den globalen Reserve-Pool.
+
+        :param product_id:        z. B. 'BTC-USD'
+        :param usd_value:         Gesamterlös des Verkaufs in USD
+        :param config_base_value: Konfigurations-base_value (für fixed_step; 0 = ignorieren)
+        """
+        reinvest_fraction = float(self._config.get("reinvest_fraction", 0.25))
+        reinvest_amount = usd_value * reinvest_fraction
+        pool_amount = usd_value - reinvest_amount
+
+        # Per-Coin Reinvestitionsbetrag kumulieren (getrennt vom aktiven base_value)
+        if reinvest_amount > 0:
+            state = self._coin_states.setdefault(product_id, {"last_action": None})
+            prev = float(state.get("reinvest_accumulated", 0.0))
+            state["reinvest_accumulated"] = prev + reinvest_amount
+            logger.info(
+                "Reinvestment: %s +%.2f USD → Reinvest-Topf (gesamt: %.2f USD)",
+                product_id, reinvest_amount, state["reinvest_accumulated"],
+            )
+
+        # Rest in Reserve-Pool
+        if pool_amount > 0:
+            self._reserve_pool_usd += pool_amount
+            logger.info(
+                "Reinvestment: %.2f USD → Reserve-Pool (gesamt: %.2f USD)",
+                pool_amount, self._reserve_pool_usd,
+            )
+            self._on_event("reserve_pool_updated", {
+                "product_id": product_id,
+                "pool_amount_added": pool_amount,
+                "reinvest_amount": reinvest_amount,
+                "total_pool_usd": self._reserve_pool_usd,
+            })
+
+    def _maybe_use_liquidity_pool(self, product_id: str, usd_needed: float) -> float:
+        """
+        Stellt Mittel aus dem Reserve-Pool für Nachkäufe bei Markteinbrüchen bereit.
+
+        :param product_id: z. B. 'BTC-USD'
+        :param usd_needed: Gewünschter USD-Betrag
+        :returns: Tatsächlich bereitgestellter Betrag (0 wenn Pool leer/unzureichend).
+        """
+        min_pool_use = float(self._config.get("min_pool_use_usd", 1.0))
+        if self._reserve_pool_usd < min_pool_use:
+            return 0.0
+        available = min(self._reserve_pool_usd, usd_needed)
+        if available <= 0:
+            return 0.0
+        self._reserve_pool_usd -= available
+        logger.info(
+            "Reserve-Pool: %.2f USD für %s verwendet (verbleibend: %.2f USD)",
+            available, product_id, self._reserve_pool_usd,
+        )
+        self._on_event("reserve_pool_used", {
+            "product_id": product_id,
+            "amount_used": available,
+            "remaining_pool_usd": self._reserve_pool_usd,
+        })
+        return available
+
+    # ------------------------------------------------------------------
+    # Circuit Breaker
+    # ------------------------------------------------------------------
+
+    def _check_and_update_circuit_breaker(
+        self, total_portfolio_usd: float, coins: List[dict]
+    ):
+        """
+        Prüft ob der globale Circuit Breaker ausgelöst werden soll.
+
+        Auslösekriterien (jeweils optional/konfigurierbar):
+          - circuit_breaker_min_portfolio_usd: Gesamtportfolio unter Schwellenwert
+          - circuit_breaker_min_fiat_usd:      Freie Fiat-Reserve unter Schwellenwert
+
+        Bei Auslösung: automatische Käufe pausiert, Event "circuit_breaker_triggered".
+        Bei Erholung:  Käufe wieder freigegeben, Event "circuit_breaker_reset".
+        """
+        min_portfolio = self._config.get("circuit_breaker_min_portfolio_usd")
+        min_fiat = self._config.get("circuit_breaker_min_fiat_usd")
+
+        triggered = False
+
+        if min_portfolio is not None and total_portfolio_usd < float(min_portfolio):
+            triggered = True
+
+        if min_fiat is not None:
+            fiat_usd = sum(
+                c.get("value_usd", 0.0) for c in coins
+                if c.get("currency") in ("USD", "USDC", "USDT")
+            )
+            if fiat_usd < float(min_fiat):
+                triggered = True
+
+        if triggered and not self._circuit_breaker_active:
+            self._circuit_breaker_active = True
+            msg = (
+                f"Circuit Breaker ausgelöst: Portfolio {total_portfolio_usd:.2f} USD. "
+                f"Automatische Käufe pausiert."
+            )
+            logger.warning(msg)
+            self._on_event("circuit_breaker_triggered", {
+                "total_portfolio_usd": total_portfolio_usd,
+                "message": msg,
+            })
+        elif not triggered and self._circuit_breaker_active:
+            self._circuit_breaker_active = False
+            logger.info("Circuit Breaker deaktiviert (Portfolio erholt).")
+            self._on_event("circuit_breaker_reset", {
+                "total_portfolio_usd": total_portfolio_usd,
+            })
 
