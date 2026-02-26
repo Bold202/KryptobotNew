@@ -12,6 +12,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Optional
 
+from ai_analyst import AIAnalyst
+
 logger = logging.getLogger(__name__)
 
 # Colour palette
@@ -34,6 +36,7 @@ class MainWindow:
         self._engine = engine
         self._client = client
         self._session = session_manager  # Sitzungsverwaltung
+        self._ai_analyst = AIAnalyst(client) if client else None
 
         self._setup_window()
         self._build_ui()
@@ -675,10 +678,12 @@ class MainWindow:
                 base_initial = initial.get("base_value", initial.get("base_value_usd", 25.0))
                 step_initial = initial.get("step", initial.get("step_usd", 0.5))
                 enabled_initial = initial.get("enabled", True)
+                cooldown_initial = initial.get("cooldown_seconds", 60)
             else:
-                base_initial, step_initial, enabled_initial = 25.0, 0.5, True
+                base_initial, step_initial, enabled_initial, cooldown_initial = 25.0, 0.5, True, 60
             base_var = _lbl_entry(dlg, "Basiswert (USD):", str(base_initial))
             step_var = _lbl_entry(dlg, "Schrittgröße (USD):", str(step_initial))
+            cooldown_var = _lbl_entry(dlg, "Cooldown (Sekunden):", str(cooldown_initial))
 
             # Aktiv-Checkbox
             enabled_row = tk.Frame(dlg, bg=BG_DARK)
@@ -693,6 +698,7 @@ class MainWindow:
                     pid = pid_var.get().strip().upper()
                     base = float(base_var.get())
                     step = float(step_var.get())
+                    cooldown = int(float(cooldown_var.get()))
                     if not pid:
                         raise ValueError("Handelspaar darf nicht leer sein.")
                     if not re.match(r'^[A-Z]{2,10}-[A-Z]{2,10}$', pid):
@@ -705,13 +711,54 @@ class MainWindow:
                         raise ValueError("Schrittgröße muss größer als 0 sein.")
                     if step >= base:
                         raise ValueError("Schrittgröße muss kleiner als der Basiswert sein.")
+                    if cooldown < 0:
+                        raise ValueError("Cooldown darf nicht negativ sein.")
                     result["product_id"] = pid
                     result["base_value"] = base
                     result["step"] = step
+                    result["cooldown_seconds"] = cooldown
                     result["enabled"] = enabled_var.get()
                     dlg.destroy()
                 except ValueError as exc:
                     messagebox.showerror("Ungültige Eingabe", str(exc), parent=dlg)
+
+            def _on_ai_analyse():
+                if self._ai_analyst is None:
+                    messagebox.showwarning(
+                        "Kein Client", "Coinbase-Client nicht verfügbar.", parent=dlg
+                    )
+                    return
+                pid = pid_var.get().strip().upper()
+                if not pid:
+                    messagebox.showwarning(
+                        "Hinweis", "Bitte zuerst ein Handelspaar eingeben.", parent=dlg
+                    )
+                    return
+                ai_btn.config(text="Analysiere…", state="disabled")
+                dlg.update_idletasks()
+                try:
+                    suggestion = self._ai_analyst.analyze_market(pid)
+                finally:
+                    ai_btn.config(text="✨ KI-Analyse", state="normal")
+                if "error" in suggestion:
+                    messagebox.showerror("KI-Analyse Fehler", suggestion["error"], parent=dlg)
+                    return
+                base_var.set(str(suggestion["base_value"]))
+                step_var.set(str(suggestion["step"]))
+                cooldown_var.set(str(suggestion["cooldown_seconds"]))
+                messagebox.showinfo(
+                    "KI-Analyse Ergebnis",
+                    f"{suggestion['reason']}\n\n"
+                    f"Analysierte Kerzen: {suggestion['candles_analyzed']}\n"
+                    f"Standardabweichung: {suggestion['std_dev']}\n"
+                    f"Volatilität: {suggestion['volatility_pct']} %",
+                    parent=dlg,
+                )
+
+            ai_btn_row = tk.Frame(dlg, bg=BG_DARK)
+            ai_btn_row.pack(pady=(4, 0))
+            ai_btn = ttk.Button(ai_btn_row, text="✨ KI-Analyse", command=_on_ai_analyse)
+            ai_btn.pack()
 
             btn_row = tk.Frame(dlg, bg=BG_DARK)
             btn_row.pack(pady=(8, 12))
